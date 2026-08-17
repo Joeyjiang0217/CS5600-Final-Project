@@ -204,54 +204,70 @@ per call than what libmalloc does — the concurrency story is the smaller half.
 Getting this right required a single-threaded baseline, which the original
 experiments did not have. It is the measurement that changed the conclusion.
 
-### Finding 2 — it loses on the pattern real programs use
+### Finding 2 — there is exactly one workload it loses, and the cost is countable
 
-| pattern (4 threads, 1 B–8 KB) | speedup |
+| size distribution (4 threads, bounded 64-object live set) | speedup |
 | --- | --- |
-| allocate 10 000, then free all | 4.42x |
-| **bounded 64-object live set** | **0.77x** |
-| thread N frees thread N+1's memory | 2.50x |
+| fixed 16 B | 2.78x |
+| random 1 B–8 KB | 3.54x |
+| **ramp 1 B–8 KB** (sizes in ascending order) | **0.78x** |
 
-The benchmark this allocator was tuned against allocates ten thousand objects and
-then frees all of them. That is close to the best case for a thread-local design:
-every object returns to the list it came from, and the next round finds those
-lists full.
+A bounded live set is not what hurts it — that is the realistic pattern, and it
+wins two of the three size distributions there. The loss is specific to
+**ascending sizes combined with a bounded live set**, and `ramp` and `random`
+draw from the *same* 1 B–8 KB range, so the distribution alone does not explain
+it either.
 
-Switch to a bounded live set — allocate, free something older, repeat, which is
-what most programs actually do — and **it comes out 23% slower than libmalloc**.
-The fast path stops being the common case, and every `free` still pays for the
-three-level page-map walk to recover the object's size. libmalloc keeps size
-metadata next to the block and skips that entirely.
+Counters compiled in behind `-DALLOC_STATS` say what does. The obvious guess —
+that the fast path collapses — is wrong: `ramp/interleaved` still serves **95%**
+of allocations from the thread-local list, and `ramp/bulk` has a *lower* hit rate
+(93.6%) while running 4.8x **faster** than malloc. Hit rate is not the variable.
 
-Part of that cost is self-inflicted: the flat one-level map would have been a
-single load, and it is only the 64-bit port that made the lookup a three-level
-descent. But the flat map cannot address a 64-bit heap at all, so the tradeoff
-is not optional.
+The number of trips to `CentralCache` is:
 
-### Finding 3 — walking sizes in order is a size-class treadmill
-
-| size pattern | bulk | interleaved |
+| workload | central-cache round trips per 1 000 allocations | ours (ms) |
 | --- | --- | --- |
-| fixed 16 B | 1.10x | 2.78x |
-| **ramp** (sizes in order) | 4.83x | **0.78x** |
-| **random** (same range) | 4.25x | **3.54x** |
+| fixed / interleaved | 0.8 | 0.72 |
+| random / interleaved | 18.3 | 1.46 |
+| ramp / interleaved | **86.8** | 4.47 |
 
-`ramp` and `random` draw from the same 1 B–8 KB range, so they ought to behave
-alike. Under `bulk` they do. Under `interleaved` they diverge by 4.5x, and the
-reason is instructive.
+Fitting `time = a x allocations + b x central_trips` on the first and third rows
+gives **a = 1.7 ns** per fast-path allocation and **b = 109 ns** per round trip —
+a locked trip through the shared layer costs about **64x** a local pop. The fit
+then predicts the middle row, which it was not given, at 1.48 ms against 1.46 ms
+measured — **1.5% error**. So the model is the explanation, not a story told
+after the fact.
 
-The ramp visits sizes in ascending order, so a 64-object window spans 64
-*consecutive and distinct* size classes. Each class is touched once and then left
-behind as the ramp moves on — its free list is refilled from `CentralCache` and
-then never reused. Random sizes keep landing back in the same ~130 classes, so
-those lists get hit over and over and the fast path works as designed.
+Why does the ramp force 100x more round trips than a fixed size? Because
+`MaxSize()` does double duty: it is the refill batch size *and* the threshold at
+which `Deallocate` flushes a list back to `CentralCache`. With a 64-object window
+and ascending sizes, allocation and deallocation are always working on
+**different** size classes — allocations pull from class `C_i` while frees push
+into `C_i-64`, which the ramp has already left behind. Nothing a thread frees ever
+replenishes what it is about to allocate, so every object makes a full round trip
+through the shared layer: fetched for one class, flushed for another. With random
+sizes, a freed object lands in a class that will be allocated from again shortly,
+so it gets recycled locally and never leaves the thread.
 
-The original benchmark called its ramp "random-sized allocations". It is worth
-being precise about that, because a deterministic ascending sweep is not a
-neutral workload for a size-class allocator — it flatters the design under
-`bulk` and punishes it under `interleaved`.
+The fast-path *rate* stays high the whole time because the ramp lingers in each
+class for 8, 16, or 128 consecutive allocations (the alignment granularity), so
+one batch of ~13 covers most of them. High hit rate, high absolute miss count —
+which is why the rate misled me and the counters did not.
 
-### Finding 4 — the memory cost is much larger than "some overhead"
+The other half of the 0.78x is not about this allocator at all: libmalloc runs
+`ramp/interleaved` in 3.48 ms but `random/interleaved` in 5.18 ms, so it is
+*faster* on the ramp than on random sizes. The ratio flips because our worst case
+and libmalloc's best case happen to be the same workload.
+
+(The cost model only holds for the bounded-live-set family. Under `bulk`, 10 000
+simultaneously live objects add cache and page-fault costs it does not capture —
+it underpredicts `fixed/bulk` by 83%.)
+
+One note of precision the original write-up got wrong: it called this ramp
+"random-sized allocations". A deterministic ascending sweep is not neutral for a
+size-class allocator — it is the one shape that defeats local recycling.
+
+### Finding 3 — the memory cost is much larger than "some overhead"
 
 Peak RSS, one allocator per process:
 
@@ -261,7 +277,7 @@ Peak RSS, one allocator per process:
 | ramp / bulk | 221 MB | 136 MB | 1.63x |
 | **ramp / interleaved** | **128 MB** | **11 MB** | **11.58x** |
 
-The same treadmill shows up as memory. Roughly 130 size classes each accumulate a
+The same lack of local recycling shows up as memory. Roughly 130 size classes each accumulate a
 free list that is never drawn from again, and `PageCache` only returns a span to
 the OS when it is 128 pages or larger — so for this workload nothing is ever
 given back. libmalloc holds 11 MB for the same 64 live objects.
@@ -279,11 +295,11 @@ production tcmalloc adds, mapped onto the problems the measurements above found:
 
 | Mechanism | Problem it solves | Here |
 | --- | --- | --- |
-| **Per-CPU caches** (restartable sequences) | Cache count scales with cores, not threads — the main lever on Finding 4 | per-thread |
+| **Per-CPU caches** (restartable sequences) | Cache count scales with cores, not threads — the main lever on Finding 3 | per-thread |
 | **Returning memory to the OS** | Idle free lists and spans stop being resident | only spans >1 MB |
-| **Transfer cache** | Smooths cross-thread frees so neither side keeps hitting the central layer | absent (Finding 2's 2.50x) |
-| **Adaptive cache sizing / periodic scavenging** | Free lists a workload has stopped using shrink back | `MaxSize()` only grows |
-| **Sized delete** (`operator delete(p, n)`) | Skips the page-map lookup when the caller knows the size — directly attacks Finding 2 | always looks up |
+| **Transfer cache** | Smooths cross-thread frees so neither side keeps hitting the central layer | absent (the 2.50x cross-thread case) |
+| **Adaptive cache sizing / periodic scavenging** | Free lists a workload has stopped using shrink back, instead of `MaxSize()` forcing a flush | `MaxSize()` only grows |
+| **Sized delete** (`operator delete(p, n)`) | Skips the page-map lookup when the caller knows the size | always looks up |
 | **Hugepage-aware backend** (Temeraire) | Fewer TLB misses on large heaps | 8 KB pages |
 | **Sampling heap profiler** | Attributing allocations in production | absent |
 
@@ -336,9 +352,10 @@ Course project, not a drop-in allocator:
   `malloc_usable_size`.
 - **No alignment guarantees beyond 8 bytes.** No over-aligned type support.
 - **Memory is essentially never returned to the OS** — only spans of 128+ pages.
-  Finding 4 is the consequence.
-- **Slower than the system allocator on bounded-live-set workloads**, which is
-  most real code. Finding 2.
+  Finding 3 is the consequence.
+- **Slower than the system allocator on one measured workload** — ascending
+  sizes with a bounded live set, 0.78x. Finding 2 quantifies why. On a bounded
+  live set with fixed or random sizes it is 2.8-3.5x faster.
 - **No unit tests.** Correctness was checked with AddressSanitizer and
   assert-enabled debug builds across the workload matrix, which is not the same
   thing as a test suite.

@@ -60,6 +60,54 @@ allocators in one process is meaningless. These are separate runs.
 | fixed 16 B | bulk | 4 160 | 4 608 | 0.90x |
 | fixed 16 B | interleaved | 2 880 | 2 656 | 1.08x |
 
+## E. Internal counters — why `ramp/interleaved` is the one loss
+
+Build with `-DALLOC_STATS` (off by default, so the measured build carries no
+counter overhead) and the allocator reports its own behaviour:
+
+```bash
+c++ -std=c++14 -O2 -DNDEBUG -DALLOC_STATS -pthread -o bench_stats \
+    main.cpp CentralCache.cpp PageCache.cpp ThreadCache.cpp
+./bench_stats --threads 4 --rounds 10 --ntimes 10000 --reps 1 \
+    --size ramp --pattern interleaved --only mine
+```
+
+4 threads, 400 000 allocations, `--only mine`:
+
+| workload | fast path | refills | flushes | central trips /1k allocs | avg batch |
+| --- | --- | --- | --- | --- | --- |
+| fixed / interleaved | 99.96% | 196 | 136 | 0.8 | 16.5 |
+| random / interleaved | 98.89% | 4 900 | 2 424 | 18.3 | 3.6 |
+| ramp / interleaved | 95.14% | 21 401 | 13 336 | **86.8** | 12.7 |
+| fixed / bulk | 99.27% | 3 206 | 1 412 | 11.5 | 136.8 |
+| random / bulk | 93.30% | 29 476 | 15 018 | 111.2 | 14.8 |
+| ramp / bulk | 93.62% | 28 061 | 16 532 | 111.5 | 16.2 |
+
+"refills" are `ThreadCache -> CentralCache` fetches; "flushes" are `ListTooLong`
+returns in the other direction. A central trip is either one.
+
+**Fast-path hit rate does not explain anything.** `ramp/interleaved` keeps 95% of
+allocations local and loses to malloc; `ramp/bulk` keeps 93.6% and beats it 4.8x.
+
+### A cost model that predicts the interleaved family
+
+Fit `time = a x allocations + b x central_trips` using only `fixed/interleaved`
+and `ramp/interleaved`:
+
+- **a = 1.71 ns** per fast-path allocation
+- **b = 109.0 ns** per CentralCache round trip (~64x a local pop)
+
+Then predict the row it was not fitted on:
+
+| workload | predicted | measured | error |
+| --- | --- | --- | --- |
+| random / interleaved | 1.48 ms | 1.46 ms | **+1.5%** |
+
+The model does *not* extend to `bulk` (it underpredicts `fixed/bulk` by 83%),
+because 10 000 simultaneously live objects add cache-miss and page-fault costs
+that a per-call model cannot see. Within the bounded-live-set family it is
+accurate enough to treat as the explanation.
+
 ## Notes on method
 
 - **Wall clock, not summed thread time.** An earlier harness accumulated each

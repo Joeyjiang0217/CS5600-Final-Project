@@ -11,6 +11,7 @@
 //     enough to swallow the per-round measurements. This uses steady_clock.
 
 #include "ConcurrentAlloc.h"
+#include "AllocStats.h"
 
 #include <chrono>
 #include <cstring>
@@ -332,6 +333,13 @@ int main(int argc, char** argv) {
         }
     }
 
+#ifdef ALLOC_STATS
+    {
+        char tag[128];
+        snprintf(tag, sizeof(tag), "%s/%s", SizeModeName(cfg.sizeMode), PatternName(cfg.pattern));
+        AllocStats::Dump(tag);
+    }
+#endif
     Stats mw = Summarize(mineWall), sw = Summarize(sysWall);
     Stats mt = Summarize(mineThread), st = Summarize(sysThread);
     double speedupWall = mw.median > 0 ? sw.median / mw.median : 0.0;

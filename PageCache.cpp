@@ -2,6 +2,7 @@
 // Created by Joe on 2025/11/12.
 //
 #include "PageCache.h"
+#include "AllocStats.h"
 
 PageCache PageCache::_sInst;
 
@@ -23,6 +24,7 @@ Span* PageCache::MapObjectToSpan(void* obj) {
 }
 
 Span* PageCache::NewSpan(size_t k) {
+    STAT_INC(spansCarved);
     assert(k > 0);
 
     // 1. If k >= NPAGES, directly allocate from the system

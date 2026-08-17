@@ -4,6 +4,17 @@
 #include <algorithm>
 #include "ThreadCache.h"
 #include "CentralCache.h"
+#include "AllocStats.h"
+
+#ifdef ALLOC_STATS
+std::atomic<size_t> AllocStats::fastHits{0};
+std::atomic<size_t> AllocStats::slowFetches{0};
+std::atomic<size_t> AllocStats::objsFetched{0};
+std::atomic<size_t> AllocStats::listReturns{0};
+std::atomic<size_t> AllocStats::spansCarved{0};
+std::atomic<size_t> AllocStats::maxSizeSum{0};
+std::atomic<size_t> AllocStats::distinctClassRefills{0};
+#endif
 
 void* ThreadCache::FetchFromCentralCache(size_t index, size_t size) {
     assert(index < NFREELISTS);
@@ -13,6 +24,7 @@ void* ThreadCache::FetchFromCentralCache(size_t index, size_t size) {
     // 2. If the demand for this size persists, the batchNum gradually increases until it reaches the maximum limit.
     // 3. The larger the size, the smaller the batchNum requested from the central cache at one time.
     // 4. The smaller the size, the larger the batchNum requested from the central cache at one time.
+    STAT_ADD(maxSizeSum, _freeList[index].MaxSize());
     size_t batchNum = (std::min)(SizeClass::NumMoveSize(size), _freeList[index].MaxSize());
     if (batchNum == _freeList[index].MaxSize()) {
         _freeList[index].MaxSize() += 1;
@@ -28,6 +40,7 @@ void* ThreadCache::FetchFromCentralCache(size_t index, size_t size) {
     // thread-local free list. Returning unconditionally matters: the old code
     // fell off the end of the function when actualNum was 0, which the assert
     // above only catches while asserts are enabled.
+    STAT_ADD(objsFetched, actualNum);
     if (actualNum > 1) {
         assert(start != end);
         _freeList[index].PushRange(NextObj(start), end, actualNum - 1);
@@ -41,8 +54,10 @@ void* ThreadCache::Allocate(size_t size) {
     size_t alignedSize = SizeClass::RoundUp(size);
     size_t index = SizeClass::Index(size);
     if (!_freeList[index].Empty()) {
+        STAT_INC(fastHits);
         return _freeList[index].Pop();
     } else {
+        STAT_INC(slowFetches);
         return FetchFromCentralCache(index, alignedSize);
     }
     
@@ -67,6 +82,7 @@ void ThreadCache::ListTooLong(FreeList& list, size_t size) {
     assert(size <= MAX_BYTES);
     void* start = nullptr;
     void* end = nullptr;
+    STAT_INC(listReturns);
     list.PopRange(start, end, list.MaxSize());
     CentralCache::GetInstance()->ReleaseListToSpans(start, size);
 }
