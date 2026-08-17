@@ -9,12 +9,17 @@
 #include <thread>
 #include <mutex>
 #include <unordered_map>
-#include <Windows.h>
 #include <algorithm>
 #include <ctime>
 #include <cassert>
-#include "ObjectPool.h"
-#include "PageMap.h"
+#include <atomic>
+
+// NOTE ON INCLUDE ORDER
+// ObjectPool.h needs SystemAlloc, and PageMap.h needs SystemAlloc, PAGE_SHIFT
+// and SizeClass::_RoundUp. Both used to be included up here, which only
+// compiled under MSVC because it resolves dependent names in templates far more
+// loosely than the standard allows. Clang and GCC reject it. Each include now
+// sits directly after the declarations it depends on.
 
 using std::cout;
 using std::endl;
@@ -27,36 +32,50 @@ static const size_t PAGE_SHIFT = 13; // 8KB
 #ifdef _WIN32
     #include <windows.h>
 #else
+    #include <sys/mman.h>
+    #include <cstring>
 #endif
 
-#ifdef _WIN64
+// Page IDs are (address >> PAGE_SHIFT). On a 64-bit host the address space is
+// far wider than 32 bits, so this must be a 64-bit type -- see PageMap.h for
+// why the page map itself also has to change.
+#if defined(_WIN64) || defined(__LP64__) || defined(_LP64)
     typedef unsigned long long PAGE_ID;
-#elif _WIN32
+#else
     typedef size_t PAGE_ID;
 #endif
 
-// System memory allocation
+// Request `kpage` pages straight from the OS's virtual-memory interface,
+// bypassing the C library allocator we are being compared against.
 inline static void* SystemAlloc(size_t kpage) {
-
+    void* ptr = nullptr;
 #ifdef _WIN32
-    void *ptr = VirtualAlloc(nullptr, kpage * (1 << 13), MEM_COMMIT | MEM_RESERVE,
-                             PAGE_READWRITE);
+    ptr = VirtualAlloc(nullptr, kpage * (1 << PAGE_SHIFT), MEM_COMMIT | MEM_RESERVE,
+                       PAGE_READWRITE);
 #else
-
+    ptr = mmap(nullptr, kpage * (1 << PAGE_SHIFT), PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (ptr == MAP_FAILED)
+        ptr = nullptr;
 #endif
     if (ptr == nullptr)
         throw std::bad_alloc();
     return ptr;
 }
 
-inline static void SystemFree(void* ptr)
+// munmap needs the length, which VirtualFree does not -- so callers pass the
+// page count they originally asked for.
+inline static void SystemFree(void* ptr, size_t kpage)
 {
 #ifdef _WIN32
+    (void)kpage;
     VirtualFree(ptr, 0, MEM_RELEASE);
 #else
-    // sbrk unmmap
+    munmap(ptr, kpage * (1 << PAGE_SHIFT));
 #endif
 }
+
+#include "ObjectPool.h"   // depends on SystemAlloc above
 
 static void*& NextObj(void* obj)
 {
@@ -226,6 +245,8 @@ public:
         return npage;
     }
 };
+
+#include "PageMap.h"   // depends on SizeClass::_RoundUp above
 
 // Span represents a contiguous block of memory pages.
 // It contains metadata about the span, including its page ID, size,

@@ -24,6 +24,7 @@ private:
 };
 
 // Thread-local pointer to ThreadCache
-static _declspec(thread) ThreadCache* pTLSThreadCache = nullptr;
+// MSVC spells this _declspec(thread); thread_local is the portable C++11 form.
+static thread_local ThreadCache* pTLSThreadCache = nullptr;
 
 #endif //INC_5600FINALPROJECT_THREADCACHE_H

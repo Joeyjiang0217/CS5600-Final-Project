@@ -24,13 +24,15 @@ void* ThreadCache::FetchFromCentralCache(size_t index, size_t size) {
     assert(start);
     assert(end);
     assert(actualNum > 0);
-    if (actualNum == 1) {
-        return start;
-    } else if (actualNum > 1) {
+    // The caller keeps the first object; anything beyond that goes on the
+    // thread-local free list. Returning unconditionally matters: the old code
+    // fell off the end of the function when actualNum was 0, which the assert
+    // above only catches while asserts are enabled.
+    if (actualNum > 1) {
         assert(start != end);
         _freeList[index].PushRange(NextObj(start), end, actualNum - 1);
-        return start;
     }
+    return start;
 }
 
 

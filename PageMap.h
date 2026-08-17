@@ -85,7 +85,7 @@ public:
     void set(Number k, void* v) {
         const Number i1 = k >> LEAF_BITS;
         const Number i2 = k & (LEAF_LENGTH - 1);
-        ASSERT(i1 < ROOT_LENGTH);
+        assert(i1 < ROOT_LENGTH);
         root_[i1]->values[i2] = v;
     }
 
@@ -117,6 +117,107 @@ public:
     void PreallocateMoreMemory() {
         // Allocate enough to keep track of all possible pages
         Ensure(0, 1 << BITS);
+    }
+};
+
+// Three-level radix tree sized for a 64-bit address space.
+//
+// Why this exists: TCMalloc_PageMap1<32-PAGE_SHIFT> above is a flat array
+// covering 2^19 page IDs, i.e. the low 4 GB only. That works for a 32-bit
+// build (the original target was -A Win32), but on a 64-bit host mmap returns
+// addresses well above 4 GB, every page ID fails the (k >> BITS) bound check,
+// get() returns NULL for perfectly valid pointers, and the first free crashes.
+//
+// Why three levels and not two: with BITS = 48 - 13 = 35, splitting in half
+// puts 2^18 entries in a leaf, which is 2 MB per node. ObjectPool refills in
+// fixed 128 KB chunks, so a 2 MB object silently overruns it. Splitting three
+// ways keeps every node at 16-32 KB. Real tcmalloc switches to a three-level
+// map on 64-bit for the same reason.
+//
+// Nodes come straight from SystemAlloc rather than ObjectPool so this structure
+// has no dependency on the pool's chunk size, are created lazily, and are never
+// freed -- so a pointer that was once published stays valid, which is what lets
+// get() run without taking the PageCache lock.
+template <int BITS>
+class TCMalloc_PageMapRadix64 {
+private:
+    static const int LEAF_BITS = BITS / 3;
+    static const int MID_BITS  = (BITS - LEAF_BITS) / 2;
+    static const int ROOT_BITS = BITS - LEAF_BITS - MID_BITS;
+
+    static const size_t LEAF_LENGTH = (size_t)1 << LEAF_BITS;
+    static const size_t MID_LENGTH  = (size_t)1 << MID_BITS;
+    static const size_t ROOT_LENGTH = (size_t)1 << ROOT_BITS;
+
+    struct Leaf { std::atomic<void*> values[LEAF_LENGTH]; };
+    struct Mid  { std::atomic<Leaf*> leaves[MID_LENGTH]; };
+
+    // Every node is comfortably under ObjectPool's 128 KB chunk, and under any
+    // reasonable page-granularity allocation.
+    static_assert(sizeof(Leaf) <= 128 * 1024, "leaf node too large");
+    static_assert(sizeof(Mid)  <= 128 * 1024, "mid node too large");
+
+    std::atomic<Mid*>* root_;   // ROOT_LENGTH entries
+
+    // Zero-filled pages straight from the OS.
+    template <class T>
+    static T* NewNode() {
+        size_t alignSize = SizeClass::_RoundUp(sizeof(T), 1 << PAGE_SHIFT);
+        void* mem = SystemAlloc(alignSize >> PAGE_SHIFT);
+        // mmap and VirtualAlloc both hand back zeroed pages, but be explicit --
+        // these slots are read without a lock and must not start as garbage.
+        memset(mem, 0, alignSize);
+        return (T*)mem;
+    }
+
+public:
+    typedef uintptr_t Number;
+
+    explicit TCMalloc_PageMapRadix64() {
+        size_t bytes = sizeof(std::atomic<Mid*>) * ROOT_LENGTH;
+        size_t alignSize = SizeClass::_RoundUp(bytes, 1 << PAGE_SHIFT);
+        root_ = (std::atomic<Mid*>*)SystemAlloc(alignSize >> PAGE_SHIFT);
+        memset(root_, 0, alignSize);
+    }
+
+    // Called on every free, without the PageCache lock held. Acquire loads pair
+    // with the release stores in set() so a reader that sees a node pointer also
+    // sees the zeroed contents behind it.
+    void* get(Number k) const {
+        if ((k >> BITS) > 0) {
+            return nullptr;
+        }
+        const Number i1 = k >> (LEAF_BITS + MID_BITS);
+        const Number i2 = (k >> LEAF_BITS) & (MID_LENGTH - 1);
+        const Number i3 = k & (LEAF_LENGTH - 1);
+
+        Mid* mid = root_[i1].load(std::memory_order_acquire);
+        if (mid == nullptr) return nullptr;
+        Leaf* leaf = mid->leaves[i2].load(std::memory_order_acquire);
+        if (leaf == nullptr) return nullptr;
+        return leaf->values[i3].load(std::memory_order_acquire);
+    }
+
+    // Callers hold the PageCache lock, so the node creation below cannot race
+    // with another set(). It can still race with a concurrent get(), which is
+    // why the stores are release stores.
+    void set(Number k, void* v) {
+        assert((k >> BITS) == 0);
+        const Number i1 = k >> (LEAF_BITS + MID_BITS);
+        const Number i2 = (k >> LEAF_BITS) & (MID_LENGTH - 1);
+        const Number i3 = k & (LEAF_LENGTH - 1);
+
+        Mid* mid = root_[i1].load(std::memory_order_relaxed);
+        if (mid == nullptr) {
+            mid = NewNode<Mid>();
+            root_[i1].store(mid, std::memory_order_release);
+        }
+        Leaf* leaf = mid->leaves[i2].load(std::memory_order_relaxed);
+        if (leaf == nullptr) {
+            leaf = NewNode<Leaf>();
+            mid->leaves[i2].store(leaf, std::memory_order_release);
+        }
+        leaf->values[i3].store(v, std::memory_order_release);
     }
 };
 
@@ -173,7 +274,7 @@ public:
     }
 
     void set(Number k, void* v) {
-        ASSERT(k >> BITS == 0);
+        assert((k >> BITS) == 0);
         const Number i1 = k >> (LEAF_BITS + INTERIOR_BITS);
         const Number i2 = (k >> LEAF_BITS) & (INTERIOR_LENGTH - 1);
         const Number i3 = k & (LEAF_LENGTH - 1);

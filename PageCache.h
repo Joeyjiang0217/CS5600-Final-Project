@@ -27,7 +27,13 @@ public:
 private:
     SpanList _spanList[NPAGES];
 //    std::unordered_map<PAGE_ID, Span*> _idSpanMap;
-    TCMalloc_PageMap1<32-PAGE_SHIFT> _idSpanMap;
+#if defined(_WIN64) || defined(__LP64__) || defined(_LP64)
+    // 48-bit user virtual addresses is the common ceiling on x86-64 and arm64,
+    // so 48 - PAGE_SHIFT page-ID bits covers everything mmap can return.
+    TCMalloc_PageMapRadix64<48 - PAGE_SHIFT> _idSpanMap;
+#else
+    TCMalloc_PageMap1<32 - PAGE_SHIFT> _idSpanMap;
+#endif
     ObjectPool<Span> _spanPool;
     PageCache(){};
     PageCache(const PageCache&) = delete;
