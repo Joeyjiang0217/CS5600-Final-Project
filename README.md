@@ -175,7 +175,9 @@ Two other real bugs surfaced on the way:
 
 Full tables and commands in [BENCHMARKS.md](BENCHMARKS.md). Apple M3 Pro, macOS,
 baseline is **macOS libmalloc**, wall clock, median of 15 runs, warm-up
-discarded.
+discarded. Headline figures are given as ranges over several independent
+measurements: run-to-run spread on this machine is 20-30%, so single numbers
+carry false precision.
 
 An earlier round of this project measured against the **Windows CRT** allocator
 and reported up to 22.8x. That number is not wrong so much as uninformative: the
@@ -185,32 +187,41 @@ opponent. Every figure below is against libmalloc.
 
 ### Finding 1 — the speed is in the fast path, not in avoiding locks
 
-| threads | speedup |
-| --- | --- |
-| 1 | 3.82x |
-| 2 | 3.93x |
-| 4 | 4.65x |
-| 8 | 4.97x |
+Five independent measurements at each end, each itself a median of 15 runs:
+
+| threads | speedup range | median |
+| --- | --- | --- |
+| 1 | 3.14x – 4.60x | 3.87x |
+| 8 | 4.01x – 5.29x | 4.43x |
 
 I built this expecting to demonstrate that per-thread caching wins by removing
 lock contention. If that were the mechanism, one thread would show roughly no
 advantage and the gap would open up with concurrency.
 
-Instead **3.82x of the final 4.97x is already present at a single thread**, where
-there is no contention to remove. Going from 1 to 8 threads adds about 30%. Most
-of the win is simply that popping a pointer off a thread-local list is cheaper
-per call than what libmalloc does — the concurrency story is the smaller half.
+It does not. **A single thread already shows the full effect**, and the two ranges
+overlap heavily — there is no scaling trend here that survives the run-to-run
+noise on this machine. Whatever this allocator is doing better, it is doing it
+per call, not by staying out of a lock: popping a pointer off a thread-local list
+is simply cheaper than what libmalloc does per allocation.
+
+That is a stronger version of the claim than "most of the win is single-threaded",
+because I cannot resolve a contention benefit at all at these thread counts.
 
 Getting this right required a single-threaded baseline, which the original
 experiments did not have. It is the measurement that changed the conclusion.
 
 ### Finding 2 — there is exactly one workload it loses, and the cost is countable
 
-| size distribution (4 threads, bounded 64-object live set) | speedup |
-| --- | --- |
-| fixed 16 B | 2.78x |
-| random 1 B–8 KB | 3.54x |
-| **ramp 1 B–8 KB** (sizes in ascending order) | **0.78x** |
+Five independent measurements each, 4 threads, bounded 64-object live set:
+
+| size distribution | speedup range | median |
+| --- | --- | --- |
+| fixed 16 B | 2.06x – 2.71x | 2.60x |
+| random 1 B–8 KB | 3.23x – 3.89x | 3.75x |
+| **ramp 1 B–8 KB** (ascending) | **0.65x – 0.82x** | **0.80x** |
+
+No range crosses 1.0, so the win/win/lose split is solid even though the exact
+figures move by 20-30% between runs.
 
 A bounded live set is not what hurts it — that is the realistic pattern, and it
 wins two of the three size distributions there. The loss is specific to
@@ -225,18 +236,24 @@ of allocations from the thread-local list, and `ramp/bulk` has a *lower* hit rat
 
 The number of trips to `CentralCache` is:
 
-| workload | central-cache round trips per 1 000 allocations | ours (ms) |
+| workload | central-cache round trips per 1 000 allocations | ours, median (ms) |
 | --- | --- | --- |
-| fixed / interleaved | 0.8 | 0.72 |
-| random / interleaved | 18.3 | 1.46 |
-| ramp / interleaved | **86.8** | 4.47 |
+| fixed / interleaved | 0.8 | 0.88 |
+| random / interleaved | 18.3 | 1.85 |
+| ramp / interleaved | **86.8** | 3.41 |
 
-Fitting `time = a x allocations + b x central_trips` on the first and third rows
-gives **a = 1.7 ns** per fast-path allocation and **b = 109 ns** per round trip —
-a locked trip through the shared layer costs about **64x** a local pop. The fit
-then predicts the middle row, which it was not given, at 1.48 ms against 1.46 ms
-measured — **1.5% error**. So the model is the explanation, not a story told
-after the fact.
+A hundredfold difference in trips to the shared layer, in the same monotonic order
+as the cost. Fitting `time = a x allocations + b x central_trips` on the first and
+third rows puts **a at roughly 2 ns** per fast-path allocation and **b at roughly
+70 ns** per round trip — a locked trip through the shared layer costs something
+like **30x** a local pop.
+
+Treat those as an order-of-magnitude decomposition, not a predictive model. Held
+out the middle row and the fit under-predicts it by 25%, outside its measured
+spread, so central trips are clearly the dominant term but not the only one — the
+random case scatters across ~130 size classes' worth of free lists and pays cache
+misses the ramp does not. (An earlier version of this README quoted a 1.5%
+prediction error from a single sample. It did not survive repetition.)
 
 Why does the ramp force 100x more round trips than a fixed size? Because
 `MaxSize()` does double duty: it is the refill batch size *and* the threshold at
@@ -254,7 +271,7 @@ class for 8, 16, or 128 consecutive allocations (the alignment granularity), so
 one batch of ~13 covers most of them. High hit rate, high absolute miss count —
 which is why the rate misled me and the counters did not.
 
-The other half of the 0.78x is not about this allocator at all: libmalloc runs
+The other half of the gap is not about this allocator at all: libmalloc runs
 `ramp/interleaved` in 3.48 ms but `random/interleaved` in 5.18 ms, so it is
 *faster* on the ramp than on random sizes. The ratio flips because our worst case
 and libmalloc's best case happen to be the same workload.
@@ -354,8 +371,8 @@ Course project, not a drop-in allocator:
 - **Memory is essentially never returned to the OS** — only spans of 128+ pages.
   Finding 3 is the consequence.
 - **Slower than the system allocator on one measured workload** — ascending
-  sizes with a bounded live set, 0.78x. Finding 2 quantifies why. On a bounded
-  live set with fixed or random sizes it is 2.8-3.5x faster.
+  sizes with a bounded live set, 0.65-0.82x. Finding 2 quantifies why. On a
+  bounded live set with fixed or random sizes it is 2.1-3.9x faster.
 - **No unit tests.** Correctness was checked with AddressSanitizer and
   assert-enabled debug builds across the workload matrix, which is not the same
   thing as a test suite.

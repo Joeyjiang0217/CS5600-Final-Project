@@ -22,10 +22,14 @@ Reproduce any row with the command shown; every knob is a flag.
 | 4 | 6.85 | 31.84 | 4.65x |
 | 8 | 9.87 | 49.05 | 4.97x |
 
-**3.82x of the eventual 4.97x is already there at one thread**, where there is no
-contention to remove. Scaling from 1 to 8 threads adds only ~30%.
+These are single runs. Repeated five times each (section F), the 1-thread and
+8-thread ranges **overlap** — 3.14-4.60x against 4.01-5.29x — so the apparent
+upward trend here is not resolvable. What survives is that **one thread already
+shows the full effect**, where there is no contention to remove.
 
 ## B. Allocation pattern — `--size ramp --threads 4`
+
+Single runs; see section F for spread.
 
 | pattern | ours (ms) | malloc (ms) | speedup |
 | --- | --- | --- | --- |
@@ -34,6 +38,9 @@ contention to remove. Scaling from 1 to 8 threads adds only ~30%.
 | `cross` — thread N frees thread N+1's memory | 6.68 | 16.73 | 2.50x |
 
 ## C. Size distribution x pattern — `--threads 4`
+
+Single runs; see section F for spread. The three `interleaved` rows are the ones
+that matter, and they are re-measured there.
 
 | size | pattern | ours (ms) | malloc (ms) | speedup |
 | --- | --- | --- | --- | --- |
@@ -89,24 +96,46 @@ returns in the other direction. A central trip is either one.
 **Fast-path hit rate does not explain anything.** `ramp/interleaved` keeps 95% of
 allocations local and loses to malloc; `ramp/bulk` keeps 93.6% and beats it 4.8x.
 
-### A cost model that predicts the interleaved family
+### Decomposing the cost
 
 Fit `time = a x allocations + b x central_trips` using only `fixed/interleaved`
-and `ramp/interleaved`:
+and `ramp/interleaved`, from medians of five independent measurements (0.88 / 1.85 / 3.41 ms):
 
-- **a = 1.71 ns** per fast-path allocation
-- **b = 109.0 ns** per CentralCache round trip (~64x a local pop)
+- **a ~ 2 ns** per fast-path allocation
+- **b ~ 70 ns** per CentralCache round trip (~30x a local pop)
 
-Then predict the row it was not fitted on:
+Held out the row it was not fitted on:
 
-| workload | predicted | measured | error |
-| --- | --- | --- | --- |
-| random / interleaved | 1.48 ms | 1.46 ms | **+1.5%** |
+| workload | predicted | measured median | measured range | error |
+| --- | --- | --- | --- | --- |
+| random / interleaved | 1.39 ms | 1.85 ms | 1.62-3.34 | **-25%** |
 
-The model does *not* extend to `bulk` (it underpredicts `fixed/bulk` by 83%),
+So central trips are the dominant term but not the only one, and this is an
+order-of-magnitude decomposition rather than a predictive model. Fitting the same
+two points from *single* runs gave a = 1.71 ns, b = 109 ns and a 1.5% error on
+the held-out row -- that agreement was a favourable sample and did not reproduce.
+
+The model does not extend to `bulk` at all (it underpredicts `fixed/bulk` by 83%),
 because 10 000 simultaneously live objects add cache-miss and page-fault costs
-that a per-call model cannot see. Within the bounded-live-set family it is
-accurate enough to treat as the explanation.
+that a per-call model cannot see.
+
+## F. Run-to-run spread
+
+Independent measurements, each already a median of 15 reps:
+
+| workload | n | range | median |
+| --- | --- | --- | --- |
+| ramp/bulk, 1 thread | 5 | 3.14x - 4.60x | 3.87x |
+| ramp/bulk, 8 threads | 5 | 4.01x - 5.29x | 4.43x |
+| fixed/interleaved | 5 | 2.06x - 2.71x | 2.60x |
+| random/interleaved | 5 | 3.23x - 3.89x | 3.75x |
+| ramp/interleaved | 11 | 0.50x - 0.82x | ~0.75x |
+
+Two consequences. The 1-thread and 8-thread ranges **overlap**, so no scaling
+trend is resolvable here. And no interleaved range crosses 1.0, so the
+win/win/lose split by size distribution is solid even though the magnitudes are
+not stable to better than 20-30%. Any single figure in the tables above should be
+read as +/- 25%.
 
 ## Notes on method
 
