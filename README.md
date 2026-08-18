@@ -249,16 +249,25 @@ experiments did not have. It is the measurement that changed the conclusion.
 
 ### Finding 2 — which workloads it loses depends on the baseline, not the design
 
-**Against three different system allocators, the same code wins and loses
-different workloads — and the differences flip sign:**
+**Against four system allocators, the same code wins and loses different
+workloads — and the differences flip sign:**
 
-| workload | Windows CRT | macOS libmalloc | glibc ptmalloc |
-| --- | --- | --- | --- |
-| fixed 16 B / bulk | 5.3x | 1.10x | **0.31x** |
-| ramp / bulk | 22.8x | 4.22x | 5.40x |
-| fixed 16 B / interleaved | — | 2.60x | **0.59x** |
-| ramp / interleaved | — | **0.71x** | 1.08x |
-| classstep / interleaved | — | 4.05x | **9.27x** |
+| workload | Windows CRT | macOS libmalloc | glibc ptmalloc | real tcmalloc |
+| --- | --- | --- | --- | --- |
+| fixed 16 B / bulk | 5.3x | 1.10x | **0.30x** | **0.26x** |
+| ramp / bulk | 22.8x | 4.22x | 5.10x | 1.29x |
+| fixed 16 B / interleaved | — | 2.60x | **0.63x** | **0.38x** |
+| ramp / interleaved | — | **0.71x** | 1.14x | **0.52x** |
+| classstep / interleaved | — | 4.05x | **9.38x** | **0.74x** |
+
+Win/loss by baseline: **everything** against Windows CRT, 4 of 5 against macOS
+libmalloc, 3 of 5 against glibc ptmalloc, **1 of 5 against real tcmalloc**.
+
+The best number in the whole project is the `classstep` row's 9.38x against glibc.
+It is also the emptiest: in absolute terms glibc takes 9.75 ms, **real tcmalloc
+0.77 ms, and this allocator 1.04 ms**. We are 35% slower than tcmalloc on the
+workload where we look 9.4x faster than glibc. That 9.4x describes glibc, not us —
+exactly like the original 22.8x described the Windows CRT heap.
 
 `fixed/bulk` goes from a 5.3x win to a 3.2x **loss** purely by changing what it is
 compared against. glibc's tcache and fastbins are excellent at a single small size

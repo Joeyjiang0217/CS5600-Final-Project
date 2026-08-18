@@ -957,6 +957,63 @@ the glibc run against 4.33 ms in the tcmalloc run for the same workload). The
 opponent-versus-opponent comparison — same binary, same harness, only the
 allocator swapped — is the solid one: **glibc 7.50 ms against tcmalloc 1.60 ms.**
 
+## T. The full cross-baseline table
+
+All five workloads against both Linux baselines, one batch, one binary,
+`LD_PRELOAD` switching the allocator. 4 threads, medians of five runs.
+
+### Opponent absolute times — the cleanest comparison
+
+Same binary, same harness, only the allocator swapped:
+
+| workload | ours | glibc ptmalloc | real tcmalloc | tcmalloc vs glibc |
+| --- | --- | --- | --- | --- |
+| fixed/bulk | 5.72 ms | 1.74 ms | **1.46 ms** | 1.2x |
+| ramp/bulk | 8.36 ms | 42.65 ms | 10.78 ms | 4.0x |
+| fixed/interleaved | 1.23 ms | 0.77 ms | **0.47 ms** | 1.6x |
+| ramp/interleaved | 4.56 ms | 5.19 ms | **2.37 ms** | 2.2x |
+| classstep/interleaved | 1.04 ms | 9.75 ms | **0.77 ms** | **12.7x** |
+
+**Real tcmalloc beats glibc on all five**, by 1.2x to 12.7x.
+
+### Us, against four baselines
+
+| workload | Windows CRT | macOS libmalloc | glibc ptmalloc | **real tcmalloc** |
+| --- | --- | --- | --- | --- |
+| fixed/bulk | 5.3x | 1.10x | 0.30x | **0.26x** |
+| ramp/bulk | 22.8x | 4.22x | 5.10x | **1.29x** |
+| fixed/interleaved | — | 2.60x | 0.63x | **0.38x** |
+| ramp/interleaved | — | **0.71x** | 1.14x | **0.52x** |
+| classstep/interleaved | — | 4.05x | **9.38x** | **0.74x** |
+
+**Against real tcmalloc we win 1 of 5.** Against glibc, 3 of 5. Against macOS
+libmalloc, 4 of 5. Against Windows CRT, everything measured.
+
+`ramp/bulk` is the only row we take from tcmalloc, and section S explains it:
+never returning memory below 1 MB. It is worth 5.10x against glibc, which
+re-faults at 642 per thousand, and only 1.29x against tcmalloc, which does not.
+
+### The single most misleading number in the project
+
+`classstep/interleaved` is our best result anywhere: **9.38x against glibc**. Read
+the absolute times and it evaporates — glibc 9.75 ms, **tcmalloc 0.77 ms, ours
+1.04 ms**. We are 35% *slower* than tcmalloc on the workload where we look 9.4x
+faster than glibc. The 9.4x is a statement about glibc handling "every allocation
+in a different size class" badly, not about this allocator handling it well.
+
+That is the cross-baseline lesson in one row, and it is the same shape as the
+original 22.8x.
+
+### Caveat on our own column
+
+Under `LD_PRELOAD` the harness's own `std::vector` allocations also route through
+tcmalloc, and our measured time shifts between modes by up to 49%
+(`ramp/interleaved`: 4.56 ms without preload against 6.78 ms with). The table
+above uses the **non-preloaded** figure as canonical for "ours", on the grounds
+that `ConcurrentAlloc` goes to `mmap` and should not depend on which malloc the
+process installed. That assumption is not verified, so ratios involving our column
+are approximate; the opponent-versus-opponent numbers are not affected.
+
 ## Notes on method
 
 - **Wall clock, not summed thread time.** An earlier harness accumulated each
