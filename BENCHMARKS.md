@@ -428,6 +428,83 @@ most of the 1-8192 range lies in that region, the simple story does not carry th
 result. The measured trip count (86.8 vs 18.3 per 1 000) is solid; the precise
 per-class accounting behind it is not something this harness pins down.
 
+## L. Why the ramp drives central traffic — derived, then tested
+
+### The derivation
+
+Two numbers set everything: the **live-set window** `W` (64 by default) and the
+**dwell length** — how many consecutive iterations stay inside one size class,
+which is fixed by the alignment of that size region:
+
+| size region | alignment | dwell |
+| --- | --- | --- |
+| 1-128 B | 8 B | 8 |
+| 129-1024 B | 16 B | 16 |
+| **1025-8192 B** | **128 B** | **128** (most of the range) |
+
+Under `interleaved`, iteration `i` allocates `size(i)` and frees the object from
+`i - W`. Follow a single class C with dwell 128, allocated from during iterations
+`[0, 128)`. Frees arrive into C during `[W, 128 + W)` — the same total count,
+**shifted later by W**. That splits C's lifetime into three phases:
+
+```
+iteration   0        64       128      192
+            |--------|--------|--------|
+alloc from C ####################          128 allocations, i in [0,128)
+free into C           ####################  128 frees,      i in [64,192)
+
+            \--only--/\--both-/\--only--/
+             drains    recycles  fills
+```
+
+1. **Drains** for `W` iterations: allocations with no frees arriving yet, so the
+   list empties and must **fetch from CentralCache**.
+2. **Recycles** for `dwell - W` iterations: frees feed allocations locally. Fast
+   path.
+3. **Fills** for `W` iterations: frees arrive after allocation has moved to the
+   next class, the list grows past `MaxSize()`, and `ListTooLong` **flushes back
+   to CentralCache**.
+
+So the forced traffic per class is ~`W` objects out and ~`W` objects back, and the
+fraction of a class's work that is forced is **`W / dwell`**. With `W = 64` and
+dwell 128 that is half. At `MaxSize ~ 15` that is ~4-5 fetches plus ~4-5 flushes
+per class, ~9 trips, over ~130 classes per round: **~1 200 trips per thread-round**
+against ~870 measured. Right order.
+
+Under `random` the same class has no phases: live objects per class average
+`64 / 130 = 0.5`, a free lands in a class that will be allocated from again in
+~130 iterations, and the list never reaches `MaxSize` in between — so the object
+is reused locally.
+
+**The mechanism is a timing offset inside one class, not allocation and
+deallocation landing in different classes.** (That earlier framing was wrong; see
+section K.)
+
+### The test
+
+If the driver is `W / dwell`, then sweeping `W` should move central traffic
+monotonically and saturate once `W` exceeds the dwell. `--window N`,
+`ramp/interleaved`, 4 threads:
+
+| `--window` | central trips /1k | fast path | ours (ms) | malloc (ms) | speedup |
+| --- | --- | --- | --- | --- | --- |
+| 4 | **18.2** | 98.88% | 1.66 | 2.63 | **1.58x** |
+| 16 | 62.5 | 96.63% | 2.08 | 2.28 | 1.10x |
+| 64 | 87.6 | 95.10% | 3.17 | 2.53 | **0.80x** |
+| 256 | 110.4 | 93.72% | 3.88 | 3.36 | 0.87x |
+| 1 024 | 110.2 | 93.73% | 4.06 | 4.55 | 1.12x |
+
+Monotonic in `W`, and **saturating at ~110 trips per thousand — which is what
+`bulk` measures (111.5)**. That is the derivation's other prediction: once
+`W` exceeds the dwell, allocation and deallocation classes are fully disjoint,
+every object must round-trip, and `interleaved` becomes indistinguishable from
+`bulk` as far as the allocator is concerned.
+
+At `W = 4` traffic falls to 18.2 — the same as `random` — and this allocator wins
+1.58x. **The ramp is not intrinsically bad for it; `W` comparable to the dwell
+is.** The losing band is roughly `16 <= W <= 256`, and it closes again at large
+`W` only because libmalloc also degrades there (2.53 -> 4.55 ms).
+
 ## Notes on method
 
 - **Wall clock, not summed thread time.** An earlier harness accumulated each

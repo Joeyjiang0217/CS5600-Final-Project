@@ -74,6 +74,7 @@ struct Config {
     unsigned seed     = 12345;
     size_t   latStride = 64;    // mean gap between latency samples
     size_t   warmup    = 1;     // discarded rounds before measuring
+    size_t   window    = 64;    // live-set size for the interleaved pattern
 };
 
 // Returns the request size for iteration `i`.
@@ -261,7 +262,7 @@ static Timing RunOnce(const Config& cfg, AllocFn Alloc, FreeFn Free,
                         // A ring buffer, not erase(begin()) on a vector -- that
                         // is O(n) per step and would swamp the allocator cost
                         // we are trying to measure.
-                        const size_t window = 64;
+                        const size_t window = cfg.window;
                         std::vector<void*> ring(window, nullptr);
                         size_t pos = 0;
                         for (size_t i = 0; i < cfg.ntimes; ++i) {
@@ -388,6 +389,7 @@ int main(int argc, char** argv) {
         else if (a == "--latency")    latency = true;
         else if (a == "--lat-stride") cfg.latStride = std::stoul(next());
         else if (a == "--warmup")     cfg.warmup = std::stoul(next());
+        else if (a == "--window")     cfg.window = std::stoul(next());
         else if (a == "--only") {
             std::string v = next();
             if      (v == "mine") { runMine = true;  runSys = false; }
@@ -407,6 +409,7 @@ int main(int argc, char** argv) {
                    "  --latency       per-call latency percentiles instead of throughput\n"
                    "  --lat-stride N  mean gap between latency samples (default 64)\n"
                    "  --warmup N      discarded rounds before measuring (default 1)\n"
+                   "  --window N      live set for --pattern interleaved (default 64)\n"
                    "  --csv           machine-readable output\n", argv[0]);
             return 0;
         }
