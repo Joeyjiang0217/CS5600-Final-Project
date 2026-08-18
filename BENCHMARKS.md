@@ -879,19 +879,83 @@ what you compare against. Any statement of the form "this allocator is Nx faster
 than malloc" is close to meaningless without naming the malloc, and this table is
 why the original 22.8x figure was the least informative number in the project.
 
-### Not measured: real tcmalloc on Linux
+### Real tcmalloc on Linux: see section S — it changes the conclusion
 
-The comparison worth having on this platform -- gperftools without the macOS
-malloc-zone shim, and ideally modern google/tcmalloc with per-CPU caches -- is not
-here. `libgoogle-perftools-dev` needs `sudo` (password required), and the VM's disk
-is 98% full with 453 MB free, which rules out a source build or Bazel. One command
-away if that changes:
+## S. Real tcmalloc on Linux — this retracts section Q's conclusion
 
-```bash
-sudo apt install -y libgoogle-perftools-dev
-cd ~/alloc-bench && g++ -std=c++14 -O2 -DNDEBUG -pthread -ltcmalloc \
-    -o bench_tc main.cpp CentralCache.cpp PageCache.cpp ThreadCache.cpp
-```
+gperftools 2.18.1 built from source into `$HOME` (no `sudo` needed; the release
+tarball ships `configure`, and `--enable-minimal` avoids the libunwind dependency)
+and injected with `LD_PRELOAD`, so **one binary is used for both baselines and only
+the allocator differs**. Verified by reading `/proc/self/maps`.
+
+### A trap in the opposite direction from macOS
+
+Linking `-ltcmalloc_minimal` the ordinary way **does not work on Ubuntu**. `ldd`
+showed no tcmalloc in the binary at all: the default `--as-needed` discards a
+shared library whose symbols nothing directly references, and our code only calls
+`malloc`, which resolves to libc. Numbers from that binary would have been glibc
+ptmalloc labelled as tcmalloc.
+
+macOS had the mirror-image problem — linking silently *did* take over `malloc`.
+Two platforms, two opposite failure modes, both invisible without checking.
+`LD_PRELOAD` plus a `/proc/self/maps` check is the only version of this experiment
+I would trust.
+
+### Results — 4 threads, medians of five runs
+
+| workload | ours | glibc ptmalloc | **real tcmalloc** | vs glibc | vs tcmalloc |
+| --- | --- | --- | --- | --- | --- |
+| ramp/interleaved | 4.33 ms | 7.50 ms | **1.60 ms** | 0.97x | **0.37x** |
+| random/interleaved | 1.64 ms | 5.93 ms | **0.91 ms** | 3.51x | **0.55x** |
+| fixed/interleaved | 1.30 ms | 0.78 ms | **0.51 ms** | 0.60x | **0.39x** |
+| ramp/bulk | 8.04 ms | 40.66 ms | **10.83 ms** | 5.14x | 1.35x |
+
+| workload | allocator | peak RSS | faults /1k |
+| --- | --- | --- | --- |
+| ramp/interleaved | ours | 107 MB | 13.2 |
+| | glibc | **6 MB** | 12.9 |
+| | real tcmalloc | 22 MB | **2.4** |
+| ramp/bulk | ours | 185 MB | 10.9 |
+| | glibc | 106 MB | **642.5** |
+| | real tcmalloc | 151 MB | 8.7 |
+
+### Section Q was wrong: real tcmalloc does solve it
+
+On `ramp/interleaved` real tcmalloc runs in **1.60 ms** — **4.7x faster than glibc
+ptmalloc and 2.7x faster than this implementation**. It is the fastest allocator
+measured on every `interleaved` workload, and it beats glibc on all four.
+
+Section Q, measuring gperftools **on macOS**, found it at 3.60 ms against
+libmalloc's 3.09 ms and concluded "the weakness is architectural, real tcmalloc
+does not fix it either". That conclusion is retracted. The macOS figure was
+crippled by the malloc-zone dispatch layer that section Q listed as a limitation
+and then reasoned past. Same source, same version: 3.60 ms through the zone shim,
+1.60 ms native.
+
+So the honest answer to "can the tcmalloc design handle this workload" is **yes,
+comfortably** — and the ~2.7x between 1.60 ms and 4.33 ms is the measured price of
+this project's simplifications, on the workload that exposes them worst.
+
+tcmalloc's page faults on `ramp/interleaved` are **2.4 per thousand against our
+13.2 and glibc's 12.9** — the lowest of the three while holding 22 MB to our
+107 MB. It is simultaneously more economical with memory *and* touching the OS
+less, which is what a working scavenger plus a transfer cache buys.
+
+### Where we still win, and why
+
+`ramp/bulk` is the one row we take (1.35x), and section I explains it: glibc
+re-faults at **642.5 faults per thousand**, tcmalloc at 8.7, us at 10.9. Against
+glibc that mechanism is worth 5.14x; against tcmalloc, which does not thrash the
+OS, it is worth only 1.35x. The page-fault finding survives, but its *size* was
+mostly a statement about glibc's trim policy, not about our design being good.
+
+### Caveat on our own numbers
+
+Under `LD_PRELOAD` the harness's own `std::vector` allocations also go through
+tcmalloc, so the "ours" column is not perfectly identical across modes (7.74 ms in
+the glibc run against 4.33 ms in the tcmalloc run for the same workload). The
+opponent-versus-opponent comparison — same binary, same harness, only the
+allocator swapped — is the solid one: **glibc 7.50 ms against tcmalloc 1.60 ms.**
 
 ## Notes on method
 

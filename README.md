@@ -343,33 +343,43 @@ One note of precision the original write-up got wrong: it called this ramp
 "random-sized allocations". A deterministic ascending sweep is not neutral for a
 size-class allocator — it is the one shape that defeats local recycling.
 
-### Finding 3 — real tcmalloc does not fix the ramp either
+### Finding 3 — real tcmalloc solves the ramp, and the gap is the price of simplifying
 
-The obvious question is whether the ramp weakness is this implementation's or the
-architecture's. gperftools tcmalloc — the design this project copies, with the
-transfer cache and the periodic scavenging it lacks — answers it:
+Is the ramp weakness this implementation's, or the architecture's? gperftools
+tcmalloc — the design this project copies, with the transfer cache and periodic
+scavenging it lacks — answers it. On Linux, injected with `LD_PRELOAD` so one
+binary serves both baselines:
 
-| ramp/interleaved | time |
-| --- | --- |
-| macOS libmalloc | **3.09 ms** |
-| real tcmalloc | 3.60 ms |
-| this allocator | 4.27 ms |
+| ramp/interleaved | time | peak RSS | faults /1k |
+| --- | --- | --- | --- |
+| **real tcmalloc** | **1.60 ms** | 22 MB | **2.4** |
+| this allocator | 4.33 ms | 107 MB | 13.2 |
+| glibc ptmalloc | 7.50 ms | **6 MB** | 12.9 |
 
-Real tcmalloc closes about 57% of the gap and **still loses to libmalloc by 17%**.
-On this workload the weakness belongs to the tcmalloc family, not to the
-simplification — though note Finding 2: against glibc ptmalloc there is no gap to
-close in the first place.
+**Real tcmalloc is 4.7x faster than glibc and 2.7x faster than this
+implementation** — while holding a fifth of our memory and touching the OS five
+times less often. It is the fastest allocator measured on every `interleaved`
+workload. So the design handles this workload comfortably, and **the 2.7x is the
+measured price of the shortcuts here**: no transfer cache, no scavenging, a flush
+threshold that cannot grow independently of the batch size.
 
-What the missing scavenging buys is **memory, not speed**: real tcmalloc holds
-32 MB where this one holds 125 MB, 3.9x less, while being slightly faster. That is
-the concrete value of the one mechanism a from-scratch reimplementation is most
-tempted to skip.
+**An earlier version of this section concluded the opposite** — that real tcmalloc
+also loses and the weakness is architectural. That measurement was gperftools *on
+macOS*, where it routes through the default malloc zone: same source, same version,
+**3.60 ms through the zone shim against 1.60 ms native**. The limitation was listed
+and then reasoned past, which is the mistake.
 
-(A trap worth recording: linking `-ltcmalloc` on macOS takes over the default
-malloc zone, so plain `malloc` routes to tcmalloc too — verified by watching
-tcmalloc's own counters. A three-way comparison in one process measures tcmalloc
-twice. Two binaries, with `ConcurrentAlloc` as the fixed point, is the only honest
-shape.)
+Two linking traps, in opposite directions, both silent:
+
+- **macOS**: linking `-ltcmalloc` takes over the default malloc zone, so plain
+  `malloc` becomes tcmalloc — a three-way comparison in one process measures
+  tcmalloc twice and mislabels a column.
+- **Linux**: linking `-ltcmalloc_minimal` normally does *nothing*, because
+  `--as-needed` drops a library nothing references directly. `ldd` shows no
+  tcmalloc at all and the run silently measures glibc.
+
+`LD_PRELOAD` plus a `/proc/self/maps` check is the only form of this comparison
+worth reporting.
 
 ### Finding 4 — tail latency follows the fast path, it is not a separate win
 
