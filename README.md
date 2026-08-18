@@ -541,16 +541,38 @@ Linux figure is the honest one and is labelled as such.
 
 `speedup > 1` means this allocator is faster than libmalloc.
 
-| workload | ours | libmalloc | speedup | n |
-| --- | --- | --- | --- | --- |
-| `classstep/interleaved` | 1.04 ms | ~4.6 ms | **~4.05x** | single runs |
-| `ramp/bulk` | 6.17 ms | 29.83 ms | **4.22x** | 5 (4.05–4.51) |
-| `random/interleaved` | 1.85 ms | 6.11 ms | **3.75x** | 5 (3.23–3.89) |
-| `fixed/interleaved` | 1.24 ms | 2.78 ms | **2.60x** | 5 (2.06–2.71) |
-| `cross` (thread N frees N+1's) | 6.68 ms | 16.73 ms | 2.50x | single |
-| `large` >256 KB | 1.54 ms | 2.19 ms | 1.42x | single |
-| `fixed/bulk` | 6.83 ms | 7.50 ms | 1.10x | single |
-| **`ramp/interleaved`** | 3.41 ms | 2.60 ms | **0.71x** | 11 (0.50–0.82) |
+All three columns are the same machine, macOS 15 on an Apple M3 Pro, 4 threads,
+medians. The tcmalloc column is gperftools 2.18.1 linked into the same harness.
+
+| workload | ours | libmalloc | tcmalloc (macOS) | vs libmalloc | vs tcmalloc |
+| --- | --- | --- | --- | --- | --- |
+| `classstep/interleaved` | 1.04 ms | ~4.6 ms | 2.53 ms | **~4.05x** | 2.43x |
+| `ramp/bulk` | 6.17 ms | 29.83 ms | 13.78 ms | **4.22x** | 2.23x |
+| `random/interleaved` | 1.85 ms | 6.11 ms | 2.23 ms | **3.75x** | 1.21x |
+| `fixed/interleaved` | 1.24 ms | 2.78 ms | 1.77 ms | **2.60x** | 1.43x |
+| `cross` (thread N frees N+1's) | 6.68 ms | 16.73 ms | 34.14 ms | 2.50x | **5.11x** |
+| `large` >256 KB | 1.54 ms | 2.19 ms | 1.52 ms | 1.42x | 0.99x |
+| `fixed/bulk` | 6.83 ms | 7.50 ms | **3.86 ms** | 1.10x | **0.57x** |
+| **`ramp/interleaved`** | 3.41 ms | 2.60 ms | 3.47 ms | **0.71x** | 1.02x |
+
+Sample counts: `ramp/interleaved` 11 runs (0.50–0.82x), `ramp/bulk` 5 (4.05–4.51x),
+`random/interleaved` 5 (3.23–3.89x), `fixed/interleaved` 5 (2.06–2.71x), the rest
+single runs for ours and libmalloc. Every tcmalloc figure is a median of 5.
+
+**Read the `vs tcmalloc` column with the zone tax in mind.** tcmalloc pays ~1.5x on
+macOS for going through the malloc zone (section V), so that column flatters this
+allocator by roughly that factor. Divide it out and most of those wins become
+losses — which is what the Linux measurements show directly: on `ramp/interleaved`
+tcmalloc runs **1.60 ms natively against 3.47 ms here**, and this allocator's honest
+standing against it is **0.52x**, not the 1.02x the macOS column suggests. The
+Linux column in BENCHMARKS.md section T is the one to quote for tcmalloc.
+
+Two rows survive that correction and are worth noting anyway. `fixed/bulk` is a
+**real loss even against zone-taxed tcmalloc** (0.57x) — glibc and mimalloc beat us
+there too, so a single small size class is simply not this design's ground.
+`cross` at 5.11x is the opposite: gperftools handles thread N freeing thread N+1's
+memory badly on macOS, 34 ms against our 6.7, and it stays a win by a wide margin
+even after dividing out the zone tax. Both are single-run figures for our side.
 
 ### Why we win, row by row
 
