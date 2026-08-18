@@ -367,6 +367,67 @@ libmalloc's internals:
 about 1 ns per call. It only shows up in allocation-dominated loops; a program
 that does real work between allocations will not notice it.
 
+## K. Decomposing the one loss: it is half us, half libmalloc
+
+`random/interleaved` and `ramp/interleaved` differ only in size distribution, and
+the ratio swings 4.8x between them. Medians of five independent measurements:
+
+| workload | ours (ms) | malloc (ms) | speedup |
+| --- | --- | --- | --- |
+| random / interleaved | 2.39 (1.75-3.26) | 7.95 (6.13-8.33) | 3.33x |
+| ramp / interleaved | 5.15 (3.76-7.03) | 3.57 (2.67-4.01) | **0.69x** |
+
+Going from random to ramp: **this allocator gets 2.2x slower and libmalloc gets
+2.2x faster.** 2.2 x 2.2 = 4.8, the whole swing. Neither side dominates, so the
+loss cannot be explained by looking at this allocator alone.
+
+### Our 2.2x, mostly accounted for
+
+Two things change on our side, and they are collinear across these workloads:
+
+| | random | ramp | factor |
+| --- | --- | --- | --- |
+| central trips / 1k allocs | 18.3 | 86.8 | 4.7x |
+| peak RSS | 53 MB | 134 MB | 2.5x |
+| our time | 2.39 ms | 5.15 ms | 2.2x |
+
+At the ~70 ns per trip from section E, the extra 68.5 trips per 1 000 over
+400 000 allocations comes to ~1.9 ms against a measured increase of 2.76 ms — so
+central trips account for roughly **70%** of it. The remainder is plausibly the
+2.5x footprint: 134 MB of spans and page-map leaves does not sit in cache, and the
+page-map walk on every `free` pays for that.
+
+Note what this rules out: `random/interleaved` *also* has a big footprint (7x
+libmalloc's) and *also* takes central trips, and we win it 3.33x. Neither factor
+is disqualifying on its own; the ramp is where both are large at once.
+
+### libmalloc's 2.2x, and what it is not
+
+Measured, same workloads: libmalloc's **peak RSS is unchanged** between random and
+ramp (7 808 vs 7 696 KiB) and its **page faults are ~0 in both** (0.1 per 1 000).
+So its improvement on the ramp is not a memory effect at all — same footprint,
+same faults, 2.2x faster.
+
+What remains is the access pattern into its own per-size-class structures: the
+ramp walks classes in order, random jumps between ~130 of them. That would be a
+cache and prefetch story. **I have not verified it** and cannot without profiling
+libmalloc's internals, so it is recorded as the leading hypothesis, not a result.
+One piece of weak support: in `bulk` libmalloc shows no random-vs-ramp preference
+(30.26 vs 29.83 ms), which is consistent with a locality effect that exists but is
+swamped there by the 43-57 faults per 1 000 that `bulk` imposes on it.
+
+### A mechanism I previously overstated
+
+I earlier described the ramp as making allocation and deallocation land on
+*different* size classes, so nothing recycles locally. That is right in the
+8-byte-alignment region (a class spans 8 consecutive iterations, so a 64-object
+window is always ~8 classes away from itself) but **not uniform**: from 1 KB to
+8 KB the alignment is 128 bytes, so one class covers 128 consecutive iterations
+and a 64-object window frequently allocates and frees within the same class. Since
+most of the 1-8192 range lies in that region, the simple story does not carry the
+result. The measured trip count (86.8 vs 18.3 per 1 000) is solid; the precise
+per-class accounting behind it is not something this harness pins down.
+
 ## Notes on method
 
 - **Wall clock, not summed thread time.** An earlier harness accumulated each
