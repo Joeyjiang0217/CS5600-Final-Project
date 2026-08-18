@@ -804,6 +804,95 @@ set, and page faults are not it. Not characterised here.
   guarantee, no `malloc_size`), so it is not a like-for-like replacement for either
   opponent.
 
+## R. On Linux against glibc ptmalloc — the baseline dominates everything
+
+Ubuntu 22.04.5, Linux 5.15 aarch64, 4 cores, **glibc 2.35 (ptmalloc)**, g++ 11.4,
+`-O2 -DNDEBUG`. ASan-clean across all 12 size x pattern combinations on this
+platform too. Built first try from the same sources.
+
+This is the baseline the original write-up's Related Work discussed at length and
+never measured.
+
+### Results, medians of five runs, 4 threads
+
+| workload | vs glibc ptmalloc | range |
+| --- | --- | --- |
+| classstep/interleaved | **9.27x** | 9.16-9.41 |
+| ramp/bulk | 5.40x | 4.93-5.53 |
+| random/interleaved | 3.31x | 0.92-3.50 |
+| random/bulk | 2.65x | 2.03-3.89 |
+| ramp/interleaved | 1.08x | 0.37-1.14 |
+| **fixed/interleaved** | **0.59x** | 0.50-0.78 |
+| **fixed/bulk** | **0.31x** | 0.27-0.48 |
+
+Thread sweep on `ramp/bulk`: **6.13x at 1 thread, 6.06x at 2, 5.21x at 4** — the
+advantage *shrinks* with concurrency here, which is a stronger version of Finding 1
+than the macOS data gave. Machine noise is low (repeating one config gives
+3.56 3.67 3.58 3.60 3.58, +/-1.5%); the wide ranges above are ptmalloc's own
+variance, not the VM's.
+
+### Two results reverse sign relative to macOS
+
+| workload | vs macOS libmalloc | vs glibc ptmalloc |
+| --- | --- | --- |
+| fixed/bulk | 1.10x | **0.31x** |
+| fixed/interleaved | 2.60x | **0.59x** |
+| ramp/interleaved | **0.71x** | 1.08x |
+
+`fixed/bulk` is a real loss, not noise: ours 5.3-5.9 ms against ptmalloc's
+1.55-2.54 ms. glibc's tcache and fastbins are very good at a single small size
+class, which is exactly the case where our per-class list has the least to offer.
+And `ramp/interleaved` — the workload sections E through Q are built around — is
+**not a loss against ptmalloc at all**.
+
+### Page faults: the mechanism is confirmed and amplified
+
+| workload | allocator | peak RSS | faults /1k |
+| --- | --- | --- | --- |
+| ramp/interleaved | ours | 122 MB | 12.2 |
+| | ptmalloc | **6 MB** | 12.9 |
+| ramp/bulk | ours | 187 MB | 7.2 |
+| | ptmalloc | 106 MB | **642.5** |
+
+**642.5 faults per thousand operations** — 16x macOS libmalloc's 40.4 on the same
+workload. glibc trims and returns memory harder than libmalloc does, re-faults it
+every round, and that is the whole 5-6x. Section I's mechanism holds across both
+platforms and is the single most portable finding in this file.
+
+The memory side is also consistent: 122 MB against 6 MB on `ramp/interleaved`, a
+20x ratio, matching macOS's 16x. Our hoarding is platform-independent.
+
+### The conclusion that supersedes the others
+
+Same code, same workloads, three baselines:
+
+| workload | Windows CRT | macOS libmalloc | glibc ptmalloc |
+| --- | --- | --- | --- |
+| fixed/bulk | 5.3x | 1.10x | **0.31x** |
+| ramp/bulk | 22.8x | 4.22x | 5.40x |
+| fixed/interleaved | — | 2.60x | **0.59x** |
+| ramp/interleaved | — | **0.71x** | 1.08x |
+
+**The spread across baselines is larger than the spread across workloads, and it
+flips signs.** `fixed/bulk` goes from a 5.3x win to a 3.2x loss purely by changing
+what you compare against. Any statement of the form "this allocator is Nx faster
+than malloc" is close to meaningless without naming the malloc, and this table is
+why the original 22.8x figure was the least informative number in the project.
+
+### Not measured: real tcmalloc on Linux
+
+The comparison worth having on this platform -- gperftools without the macOS
+malloc-zone shim, and ideally modern google/tcmalloc with per-CPU caches -- is not
+here. `libgoogle-perftools-dev` needs `sudo` (password required), and the VM's disk
+is 98% full with 453 MB free, which rules out a source build or Bazel. One command
+away if that changes:
+
+```bash
+sudo apt install -y libgoogle-perftools-dev
+cd ~/alloc-bench && g++ -std=c++14 -O2 -DNDEBUG -pthread -ltcmalloc \
+    -o bench_tc main.cpp CentralCache.cpp PageCache.cpp ThreadCache.cpp
+```
+
 ## Notes on method
 
 - **Wall clock, not summed thread time.** An earlier harness accumulated each

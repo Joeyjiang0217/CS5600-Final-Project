@@ -182,8 +182,16 @@ carry false precision.
 An earlier round of this project measured against the **Windows CRT** allocator
 and reported up to 22.8x. That number is not wrong so much as uninformative: the
 Windows CRT heap serialises on a global lock and is the weakest baseline
-available. libmalloc already keeps per-thread magazines, so it is a real
-opponent. Every figure below is against libmalloc.
+available.
+
+Measurements here are against three allocators, and **the choice of baseline
+turns out to matter more than the choice of workload** (Finding 2):
+
+| baseline | platform | notes |
+| --- | --- | --- |
+| **macOS libmalloc** | Apple M3 Pro, macOS 15 | per-thread magazines; the default figures below |
+| **glibc ptmalloc 2.35** | Ubuntu 22.04, aarch64, 4 cores | per-thread arenas + tcache; the baseline the original write-up discussed and never measured |
+| **gperftools tcmalloc 2.18** | macOS | the architecture this project copies |
 
 ### Finding 1 — the speed is in the fast path, not in avoiding locks
 
@@ -207,12 +215,39 @@ is simply cheaper than what libmalloc does per allocation.
 That is a stronger version of the claim than "most of the win is single-threaded",
 because I cannot resolve a contention benefit at all at these thread counts.
 
+**Linux makes the point harder.** Against glibc ptmalloc on a 4-core Ubuntu VM the
+advantage on `ramp/bulk` *decreases* with concurrency — **6.13x at 1 thread, 6.06x
+at 2, 5.21x at 4** — on a machine whose repeat noise is +/-1.5%. Two platforms,
+two system allocators, and in neither does the advantage come from scaling.
+
 Getting this right required a single-threaded baseline, which the original
 experiments did not have. It is the measurement that changed the conclusion.
 
-### Finding 2 — there is exactly one workload it loses, and the cost is countable
+### Finding 2 — which workloads it loses depends on the baseline, not the design
 
-Five independent measurements each, 4 threads, bounded 64-object live set:
+**Against three different system allocators, the same code wins and loses
+different workloads — and the differences flip sign:**
+
+| workload | Windows CRT | macOS libmalloc | glibc ptmalloc |
+| --- | --- | --- | --- |
+| fixed 16 B / bulk | 5.3x | 1.10x | **0.31x** |
+| ramp / bulk | 22.8x | 4.22x | 5.40x |
+| fixed 16 B / interleaved | — | 2.60x | **0.59x** |
+| ramp / interleaved | — | **0.71x** | 1.08x |
+| classstep / interleaved | — | 4.05x | **9.27x** |
+
+`fixed/bulk` goes from a 5.3x win to a 3.2x **loss** purely by changing what it is
+compared against. glibc's tcache and fastbins are excellent at a single small size
+class, which is where a per-class thread list has least to add. Meanwhile
+`ramp/interleaved` — the workload the rest of this section dissects — **is not a
+loss against ptmalloc at all**.
+
+So "which workload does it lose" has no answer independent of the baseline. What
+follows characterises the macOS libmalloc case, because that is where the loss was
+sharpest and therefore most informative about the design.
+
+Five independent measurements each, 4 threads, bounded 64-object live set,
+**against macOS libmalloc**:
 
 | size distribution | speedup range | median |
 | --- | --- | --- |
@@ -284,7 +319,35 @@ One note of precision the original write-up got wrong: it called this ramp
 "random-sized allocations". A deterministic ascending sweep is not neutral for a
 size-class allocator — it is the one shape that defeats local recycling.
 
-### Finding 3 — tail latency follows the fast path, it is not a separate win
+### Finding 3 — real tcmalloc does not fix the ramp either
+
+The obvious question is whether the ramp weakness is this implementation's or the
+architecture's. gperftools tcmalloc — the design this project copies, with the
+transfer cache and the periodic scavenging it lacks — answers it:
+
+| ramp/interleaved | time |
+| --- | --- |
+| macOS libmalloc | **3.09 ms** |
+| real tcmalloc | 3.60 ms |
+| this allocator | 4.27 ms |
+
+Real tcmalloc closes about 57% of the gap and **still loses to libmalloc by 17%**.
+On this workload the weakness belongs to the tcmalloc family, not to the
+simplification — though note Finding 2: against glibc ptmalloc there is no gap to
+close in the first place.
+
+What the missing scavenging buys is **memory, not speed**: real tcmalloc holds
+32 MB where this one holds 125 MB, 3.9x less, while being slightly faster. That is
+the concrete value of the one mechanism a from-scratch reimplementation is most
+tempted to skip.
+
+(A trap worth recording: linking `-ltcmalloc` on macOS takes over the default
+malloc zone, so plain `malloc` routes to tcmalloc too — verified by watching
+tcmalloc's own counters. A three-way comparison in one process measures tcmalloc
+twice. Two binaries, with `ConcurrentAlloc` as the fixed point, is the only honest
+shape.)
+
+### Finding 4 — tail latency follows the fast path, it is not a separate win
 
 Throughput answers "how long do 400 000 calls take". It says nothing about the
 worst call in a thousand, which is what a latency-sensitive service cares about.
@@ -330,11 +393,11 @@ structural.
 
 One number worth keeping: libmalloc's worst single `free` was **592 µs**. That is
 what returning memory to the OS costs — the same behaviour that makes it use 11x
-less memory in Finding 5. This allocator never returns anything under 1 MB, so it
+less memory in Finding 6. This allocator never returns anything under 1 MB, so it
 never pays that spike. Footprint and tail latency are one trade-off seen from two
 sides.
 
-### Finding 4 — the big `bulk` win is a page-fault result, not an allocator one
+### Finding 5 — the big `bulk` win is a page-fault result, not an allocator one
 
 `ramp/bulk` wins 4.5x and `ramp/interleaved` loses 0.8x, which looks like one
 design meeting its best and worst case. It is not. They are **two unrelated
@@ -374,9 +437,9 @@ CentralCache reason in Finding 2.
 Which means the honest summary of this allocator is narrower than either number
 suggests on its own: **it is faster per call, and it wins big whenever hoarding
 memory is the right trade** — and it pays for that hoarding in footprint
-(Finding 5) and, on the ramp, in tail latency (Finding 3).
+(Finding 6) and, on the ramp, in tail latency (Finding 4).
 
-### Finding 5 — the memory cost is much larger than "some overhead"
+### Finding 6 — the memory cost is much larger than "some overhead"
 
 Peak RSS, one allocator per process:
 
@@ -404,7 +467,7 @@ production tcmalloc adds, mapped onto the problems the measurements above found:
 
 | Mechanism | Problem it solves | Here |
 | --- | --- | --- |
-| **Per-CPU caches** (restartable sequences) | Cache count scales with cores, not threads — the main lever on Finding 5 | per-thread |
+| **Per-CPU caches** (restartable sequences) | Cache count scales with cores, not threads — the main lever on Finding 6 | per-thread |
 | **Returning memory to the OS** | Idle free lists and spans stop being resident | only spans >1 MB |
 | **Transfer cache** | Smooths cross-thread frees so neither side keeps hitting the central layer | absent (the 2.50x cross-thread case) |
 | **Adaptive cache sizing / periodic scavenging** | Free lists a workload has stopped using shrink back, instead of `MaxSize()` forcing a flush | `MaxSize()` only grows |
@@ -466,7 +529,7 @@ Course project, not a drop-in allocator:
   `malloc_usable_size`.
 - **No alignment guarantees beyond 8 bytes.** No over-aligned type support.
 - **Memory is essentially never returned to the OS** — only spans of 128+ pages.
-  Finding 5 is the consequence.
+  Finding 6 is the consequence.
 - **Slower than the system allocator on one measured workload** — ascending
   sizes with a bounded live set, 0.65-0.82x. Finding 2 quantifies why. On a
   bounded live set with fixed or random sizes it is 2.1-3.9x faster.
@@ -475,13 +538,16 @@ Course project, not a drop-in allocator:
   thing as a test suite.
 - **The page map's lock-free reads are only safe because nodes are never freed.**
   Adding reclamation would need real memory ordering work or hazard pointers.
-- **Single machine, single baseline.** All numbers are one Apple M3 Pro against
-  macOS libmalloc. glibc's ptmalloc, jemalloc, mimalloc and real tcmalloc would
-  all behave differently, and the honest comparison for a "tcmalloc-style"
-  allocator is against tcmalloc itself — which I have not run.
+- **Three baselines, two platforms, and that is still not enough.** Apple M3 Pro
+  against macOS libmalloc and gperftools tcmalloc, plus a 4-core Ubuntu aarch64 VM
+  against glibc ptmalloc. Finding 2 shows the baseline dominates the result, so
+  jemalloc and mimalloc would likely shift it again. Modern google/tcmalloc with
+  per-CPU caches — the mechanism this README keeps citing as the fix for the memory
+  problem — is **not measured**: it needs Bazel and is Linux-only, and the VM has
+  453 MB of free disk.
 - **Run-to-run variance is not a tail-latency result.** `libmalloc`'s standard
   deviation across whole runs is high, but that is a statement about 400 000
-  operations in aggregate. Measured per call (Finding 3), the tail goes the other
+  operations in aggregate. Measured per call (Finding 4), the tail goes the other
   way on this allocator's worst workload.
 - **`libmalloc`'s run-to-run variance is high** (standard deviation often 30–50%
   of its median under load) even with warm-up and alternated ordering. Medians
