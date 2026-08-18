@@ -139,6 +139,13 @@ struct Timing {
 // you tell those two apart instead of guessing.
 static size_t MinorFaults() {
 #if defined(_WIN32)
+    // Windows counts soft and hard faults together in PageFaultCount. Close
+    // enough for the comparison this is used for -- a heap that returns memory
+    // to the OS and faults it back in shows up here the same way ru_minflt
+    // shows it on POSIX.
+    PROCESS_MEMORY_COUNTERS pmc;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+        return (size_t)pmc.PageFaultCount;
     return 0;
 #else
     struct rusage ru;
