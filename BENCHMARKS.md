@@ -930,9 +930,10 @@ measured on every `interleaved` workload, and it beats glibc on all four.
 Section Q, measuring gperftools **on macOS**, found it at 3.60 ms against
 libmalloc's 3.09 ms and concluded "the weakness is architectural, real tcmalloc
 does not fix it either". That conclusion is retracted. The macOS figure was
-crippled by the malloc-zone dispatch layer that section Q listed as a limitation
-and then reasoned past. Same source, same version: 3.60 ms through the zone shim,
-1.60 ms native.
+depressed by the malloc-zone dispatch layer that section Q listed as a limitation
+and then reasoned past: 3.60 ms through the zone against 1.60 ms native. Section V
+decomposes that gap — the zone layer is ~1.5x of it, measured, and ~1.33x remains
+unattributed.
 
 So the honest answer to "can the tcmalloc design handle this workload" is **yes,
 comfortably** — and the ~2.7x between 1.60 ms and 4.33 ms is the measured price of
@@ -1271,6 +1272,77 @@ How badly a shared process corrupts this, measured rather than asserted:
 - gperftools supports only `tcmalloc_minimal` on Windows. The Linux and macOS
   measurements also used the minimal build, so the configuration matches; the
   allocation fast path is the same as full tcmalloc.
+
+## V. Decomposing the macOS/Linux tcmalloc gap — the zone layer is only two thirds
+
+Sections S and the README attributed the whole macOS/Linux tcmalloc gap
+(3.60 ms against 1.60 ms on `ramp/interleaved`) to the macOS malloc-zone
+dispatch layer. Measured properly, it is about two thirds of it, and the rest is
+unattributed.
+
+### Ruling out the machine first
+
+The two environments are the same physical CPU — the Linux box is an aarch64 VM
+on the same M3 Pro — and a VM is normally *slower* than native, which works
+against the Linux number rather than for it. There is also a calibration object
+sitting in the data: **this allocator measures 4.27 ms on macOS and 4.33 ms on
+Linux** for the same workload. The environments are equally fast for it, so the
+tcmalloc gap is specific to tcmalloc.
+
+### Measuring the zone layer directly
+
+On macOS, `malloc` reaches tcmalloc through the default malloc zone: `&malloc`
+still resolves into `libsystem_malloc.dylib` and `malloc_default_zone()` is still
+named `DefaultMallocZone`, yet allocations land in tcmalloc (verified by watching
+`generic.current_allocated_bytes`). So `malloc` and `tc_malloc` end in the same
+allocator with one extra layer of dispatch between them, and the difference is
+measurable in a single process. Eight alternating runs of each binary, `ramp`
+sizes, 64-object window, 4 threads:
+
+| build | path | median | range |
+| --- | --- | --- | --- |
+| `libtcmalloc` (full) | `malloc()` via zone | 3.10 ms | 2.82–3.76 |
+| `libtcmalloc` (full) | `tc_malloc()` direct | **2.16 ms** | 1.91–3.41 |
+| `libtcmalloc_minimal` | `malloc()` via zone | 3.27 ms | 2.82–3.91 |
+| `libtcmalloc_minimal` | `tc_malloc()` direct | **2.13 ms** | 1.79–2.37 |
+
+**The zone dispatch costs 1.44x (full) and 1.53x (minimal)** — two independent
+measurements agreeing on ~1.5x.
+
+### A build mismatch I had, which turned out not to matter
+
+Section Q used Homebrew's **full** `libtcmalloc` on macOS while sections S and U
+used a source-built **`--enable-minimal`** on Linux and Windows. Same version,
+different configuration — the full build carries the heap-profiler `MallocHook`
+callbacks, so it looked like a plausible second cause.
+
+It is not: **full against minimal on the direct path is 1.01x.** Homebrew ships
+`libtcmalloc_minimal.dylib` as well, so this was checkable rather than assumable,
+and the mismatch is immaterial at least on this workload.
+
+### What remains
+
+| component | factor |
+| --- | --- |
+| macOS malloc-zone dispatch | **~1.5x** |
+| full vs minimal build | 1.01x (none) |
+| **remaining, unattributed** | **1.33x** (macOS 2.13 ms against Linux 1.60 ms) |
+
+`1.5 x 1.33 = 2.0x`, against an originally reported 2.25x — the balance is that
+the original macOS figure of 3.60 ms reads 3.10–3.27 ms in this cleaner paired
+setup.
+
+The remaining **1.33x is not explained here**. It is not general machine speed
+(this allocator is equal across the two), and it is not the build configuration.
+Plausible candidates are tcmalloc's page-size assumptions against macOS arm64's
+16 KB OS pages, and its `madvise`/`mmap` paths differing between kernels — neither
+checked, and both would need profiling gperftools itself.
+
+**So the correct statement is that the zone layer accounts for roughly two thirds
+of the gap and something platform-specific accounts for the rest.** Section S's
+retraction of section Q still stands — real tcmalloc does solve `ramp/interleaved`,
+at 1.60 ms — but the reason the macOS figure understated it was only partly the
+shim.
 
 ## Notes on method
 

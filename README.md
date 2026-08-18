@@ -390,9 +390,15 @@ threshold that cannot grow independently of the batch size.
 
 **An earlier version of this section concluded the opposite** — that real tcmalloc
 also loses and the weakness is architectural. That measurement was gperftools *on
-macOS*, where it routes through the default malloc zone: same source, same version,
-**3.60 ms through the zone shim against 1.60 ms native**. The limitation was listed
-and then reasoned past, which is the mistake.
+macOS*, where it routes through the default malloc zone: **3.60 ms through the zone
+against 1.60 ms native**. The limitation was listed and then reasoned past, which
+is the mistake.
+
+Measured since (BENCHMARKS.md section V), the zone layer is **~1.5x** of that gap —
+`malloc()` against `tc_malloc()` in one process, 3.10 ms against 2.16 ms — and
+**~1.33x of it remains unattributed**. Not the machine: this allocator measures
+4.27 ms on macOS and 4.33 ms on Linux. Not the build either: a suspected full-vs-
+minimal mismatch measures 1.01x.
 
 Two linking traps, in opposite directions, both silent:
 
@@ -525,10 +531,11 @@ the other way — one allocator against one allocator, with the reason for each 
 
 **A note on the tcmalloc column.** Everything for this allocator and libmalloc is
 the same machine (Apple M3 Pro, macOS 15, 4 threads, medians). Real tcmalloc is
-shown for scale, but its *macOS* numbers are depressed by the malloc-zone
-dispatch layer it goes through there — same source and version reads 3.60 ms on
-macOS against **1.60 ms on Linux** for `ramp/interleaved` (Finding 3). Where
-tcmalloc matters below, the Linux figure is the honest one and is labelled as such.
+shown for scale, but its *macOS* numbers are depressed: it reads 3.60 ms there
+against **1.60 ms on Linux** for `ramp/interleaved`. About 1.5x of that is the
+macOS malloc-zone dispatch layer it goes through, measured directly; the remaining
+1.33x is unexplained (BENCHMARKS.md section V). Where tcmalloc matters below, the
+Linux figure is the honest one and is labelled as such.
 
 ### Throughput
 
