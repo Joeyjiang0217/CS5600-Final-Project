@@ -93,9 +93,16 @@ void ThreadCache::Deallocate(void* ptr, size_t size) {
     _freeList[index].Push(ptr);
 
     // Check if the free list is too long
+#ifdef DECOUPLED_LISTS
+    // Threshold is the independent capacity, not the transfer batch.
+    if (_freeList[index].Size() >= _freeList[index].Capacity()) {
+        ListTooLong(_freeList[index], alignedSize);
+    }
+#else
     if (_freeList[index].Size() >= _freeList[index].MaxSize()) {
         ListTooLong(_freeList[index], alignedSize);
     }
+#endif
 }
 
 void ThreadCache::ListTooLong(FreeList& list, size_t size) {
@@ -103,6 +110,23 @@ void ThreadCache::ListTooLong(FreeList& list, size_t size) {
     void* start = nullptr;
     void* end = nullptr;
     STAT_INC(listReturns);
+#ifdef DECOUPLED_LISTS
+    // Hysteresis: flush down to half the capacity instead of emptying the list.
+    // Popping exactly the threshold leaves nothing behind, so the very next
+    // allocation of this class has to go back to CentralCache -- a flush
+    // immediately followed by a refill.
+    size_t keep = list.Capacity() / 2;
+    size_t n = list.Size() > keep ? list.Size() - keep : list.Size();
+    list.PopRange(start, end, n);
+
+    // A flush means the pile did not fit, so capacity was too small. Grow it.
+    // Bounded at 2x NumMoveSize: capacity is a memory decision, so it needs
+    // *a* bound, just not the transfer-size bound that MaxSize() carries.
+    size_t cap = 2 * SizeClass::NumMoveSize(size);
+    size_t next = list.Capacity() * 2;
+    list.Capacity() = next > cap ? cap : next;
+#else
     list.PopRange(start, end, list.MaxSize());
+#endif
     CentralCache::GetInstance()->ReleaseListToSpans(start, size);
 }

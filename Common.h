@@ -114,6 +114,18 @@ public:
         return _maxSize;
     }
 
+    // One number cannot express three different quantities. _maxSize is the
+    // refill batch (a transfer-cost decision, rightly bounded by NumMoveSize),
+    // the flush threshold (a cache-capacity decision, which has nothing to do
+    // with transfer size), and the flush amount (which should leave a working
+    // set behind rather than empty the list). -DDECOUPLED_LISTS splits them.
+#ifdef DECOUPLED_LISTS
+    size_t& Capacity()
+    {
+        return _capacity;
+    }
+#endif
+
     void PushRange(void* start, void* end, size_t n)
     {
         assert(start != nullptr && end != nullptr);
@@ -124,10 +136,17 @@ public:
 
     void PopRange(void*& start, void*& end, size_t n)
     {
-        assert(n >= _size);
+        // This read `assert(n >= _size)`, which is backwards: you cannot pop
+        // more than the list holds. It never fired because the only caller
+        // popped exactly MaxSize() at the moment Size() had just reached it, so
+        // n == _size and both directions happened to hold. Any change to the
+        // flush amount trips it -- which is exactly what happened when the
+        // flush gained a low-water mark.
+        assert(n > 0);
+        assert(n <= _size);
         start = _freelist;
         end = start;
-        for (int i = 0; i < n - 1; ++i)
+        for (size_t i = 0; i < n - 1; ++i)
         {
             end = NextObj(end);
         }
@@ -145,6 +164,9 @@ private:
     void* _freelist = nullptr;
     size_t _maxSize = 1;
     size_t _size = 0;
+#ifdef DECOUPLED_LISTS
+    size_t _capacity = 1;    // high-water mark, grown independently of _maxSize
+#endif
 };
 
 

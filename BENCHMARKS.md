@@ -637,6 +637,86 @@ production tcmalloc does, and this experiment is why.
 The switch is left in the code as `-DMAXSIZE_GROWTH_MULT`; the default build keeps
 additive growth, since on these workloads it is the better memory/speed point.
 
+## O. Decoupling the three roles: a negative result
+
+Section N concluded that the roles must be separated. So separate them:
+`-DDECOUPLED_LISTS` gives `FreeList` an independent `_capacity` used as the flush
+threshold, doubling on each flush (a flush means the pile did not fit) and capped
+at `2 x NumMoveSize`, plus hysteresis -- flush down to `capacity / 2` rather than
+emptying the list. `_maxSize` keeps its original additive growth and remains the
+transfer batch only. Combined with `-DMAXSIZE_GROWTH_MULT` as a fourth variant.
+All four ASan-clean across 12 size x pattern combinations.
+
+**It is worse on both axes.**
+
+| workload | metric | additive | multiplicative | **decoupled** | both |
+| --- | --- | --- | --- | --- | --- |
+| ramp/interleaved | speedup | 0.70x | **0.94x** | **0.62x** | 0.63x |
+| ramp/interleaved | peak RSS | 142 MB | 202 MB | **289 MB** | 299 MB |
+| random/interleaved | speedup | 3.12x | 3.40x | 3.35x | 3.24x |
+| random/interleaved | peak RSS | 53 MB | 58 MB | 55 MB | 56 MB |
+| ramp/bulk | speedup | 4.26x | 4.29x | **3.37x** | 3.30x |
+| ramp/bulk | peak RSS | 207 MB | 293 MB | **420 MB** | 429 MB |
+
+The one-line multiplicative change stays the best of the four. The considered
+redesign is slower than doing nothing and holds twice the memory.
+
+### Three reasons, all visible in the counters
+
+Central traffic on `ramp/interleaved`, per 1 000 allocations:
+
+| variant | refills | flushes | total | avg batch |
+| --- | --- | --- | --- | --- |
+| additive | 53.9 | 33.6 | 87.5 | 12.9 |
+| multiplicative | 27.1 | **5.3** | **32.4** | 12.2 |
+| decoupled | 31.3 | 14.5 | 45.9 | **6.0** |
+| both | **22.8** | 14.6 | 37.4 | 11.8 |
+
+**1. The hysteresis backfires.** Flushing down to `capacity / 2` leaves the list
+half full, so the next pile has only half the headroom and trips the threshold
+again. Emptying the list -- which is what the original does -- leaves *more* room
+for the next pile. The drain phase wants objects retained; the fill phase wants
+headroom. One flush policy cannot serve both, and I picked the wrong one for the
+phase that dominates.
+
+**2. Changing role 2 starved role 1's growth signal.** `_maxSize` grows only on a
+refill. Hysteresis makes the list non-empty more often, so refills get rarer, so
+`_maxSize` grows more slowly -- average batch falls from 12.9 to **6.0**. Reducing
+trips reduced the signal the batch size uses to learn, which then increased trips.
+The roles are coupled through the *control loop*, not only through the shared
+variable, which is not something splitting the variable fixes.
+
+**3. Capacity ratchets up and never comes down.** `_capacity` only grows. It
+climbs to its `2 x NumMoveSize` cap and stays, so every size class the workload
+ever touches holds that much forever: 289 MB against additive's 142 MB, for less
+speed. This is defect C from section M, which I listed and then did not implement
+a fix for -- and the memory result is exactly what that omission predicts.
+
+### What this actually establishes
+
+**Decoupling without scavenging is strictly worse than not decoupling.** Raising a
+cache's capacity is only safe if something also lowers it; otherwise capacity
+becomes a high-water mark on memory for the life of the process. Production
+tcmalloc separates batch from capacity *and* runs periodic scavenging plus
+per-CPU caches to bound the total, and this result is a concrete demonstration of
+why the second half is not optional.
+
+The default build keeps additive growth. All variants are compile-time switches
+and none is shipped as default.
+
+## P. A latent bug this surfaced
+
+`FreeList::PopRange` asserted `n >= _size` -- backwards; you cannot pop more than
+the list holds. It never fired because the only caller popped exactly `MaxSize()`
+at the moment `Size()` had reached it, so `n == _size` satisfied both directions.
+Adding a low-water mark made `n < _size` and it fired immediately, in all 12
+workload combinations.
+
+Fixed to `assert(n > 0); assert(n <= _size);`. Note what this means for the
+original code: under `-DNDEBUG` the assert is compiled out, so a future change to
+the flush amount would have silently corrupted `_size` in release builds while
+appearing fine in debug. The loop index was also `int` against a `size_t` count.
+
 ## Notes on method
 
 - **Wall clock, not summed thread time.** An earlier harness accumulated each
