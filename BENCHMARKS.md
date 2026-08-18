@@ -569,6 +569,74 @@ at the same design flaw noted in section E, `MaxSize()` serving as both the refi
 batch and the flush threshold. Raising the flush threshold above the pile, or
 decoupling the two, is the fix the model predicts. Untested so far.
 
+## N. Testing the fix: multiplicative growth works, and is not worth it
+
+Section M predicted that `MaxSize()`'s additive growth is the root cause, and that
+making it multiplicative would collapse the central traffic. Build with
+`-DMAXSIZE_GROWTH_MULT` to double instead of incrementing, clamped to
+`NumMoveSize(size)`. ASan-clean across all 12 size x pattern combinations.
+
+### The mechanism is confirmed
+
+`interleaved`, W = 64, 4 threads, `--only mine`:
+
+| size | growth | central trips /1k | avg MaxSize | avg batch | fast path |
+| --- | --- | --- | --- | --- | --- |
+| ramp | additive | 87.2 | 15.5 | 12.7 | 95.11% |
+| ramp | **multiplicative** | **30.5** | 24.9 | 12.3 | 97.67% |
+| random | additive | 18.5 | 3.8 | 3.7 | 98.88% |
+| random | multiplicative | **6.2** | 2.0 | 2.0 | 99.44% |
+| fixed | additive | 0.8 | 16.5 | 16.5 | 99.96% |
+| fixed | multiplicative | **0.1** | 18.1 | 17.1 | 99.99% |
+
+Traffic falls 2.9x on the ramp and improves on every workload. Note `avg batch`
+barely moves (12.7 -> 12.3): the win comes from the **flush threshold**, role 2,
+not the refill batch, role 1 — exactly what the pile model says should happen.
+
+### But it does not fix the loss, and it costs memory
+
+Speedups, medians of five independent processes:
+
+| workload | additive | multiplicative |
+| --- | --- | --- |
+| **ramp/interleaved** | 0.71x | **0.92x** |
+| random/interleaved | 3.11x | 3.22x |
+| fixed/interleaved | 2.16x | 2.35x |
+| ramp/bulk | 4.44x | 4.08x |
+
+Peak RSS, `--only mine`, separate processes:
+
+| workload | additive | multiplicative | change |
+| --- | --- | --- | --- |
+| ramp/interleaved | 132 MB | **210 MB** | **+59%** |
+| ramp/bulk | 223 MB | **308 MB** | +38% |
+| random/interleaved | 54 MB | 60 MB | +10% |
+
+So on the workload it was meant to fix: **30% faster, 59% more memory, and still
+slower than libmalloc** — which uses 8 MB for the same work. 132 MB against
+libmalloc was 16x; 210 MB is 26x.
+
+### What the experiment actually established
+
+Two things, one of which reverses an earlier judgement.
+
+**The two cost terms are in tension.** Section K attributed ~70% of our ramp
+degradation to central trips and the rest to footprint. Cutting trips 2.9x bought
+only 30% wall-clock, because the same change grew the footprint 59% and the
+footprint term pushed back. Additive and multiplicative are two points on a
+trade-off curve, not a bug and its fix.
+
+**The decoupling is necessary after all.** Section M downgraded "split the three
+roles" in favour of "just grow faster". That was wrong: growing faster raises the
+flush threshold, the refill batch, *and* the retained memory together, because one
+variable controls all three. Getting the traffic reduction without the footprint
+needs role 2 (cache capacity) raised while role 1 (batch) stays modest, plus the
+scavenging that defect C describes so idle capacity is given back. That is what
+production tcmalloc does, and this experiment is why.
+
+The switch is left in the code as `-DMAXSIZE_GROWTH_MULT`; the default build keeps
+additive growth, since on these workloads it is the better memory/speed point.
+
 ## Notes on method
 
 - **Wall clock, not summed thread time.** An earlier harness accumulated each

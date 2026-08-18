@@ -31,7 +31,22 @@ void* ThreadCache::FetchFromCentralCache(size_t index, size_t size) {
     if (size >= 1024) { STAT_INC(bigRefills); STAT_ADD(bigMaxSizeSum, _freeList[index].MaxSize()); }
     size_t batchNum = (std::min)(SizeClass::NumMoveSize(size), _freeList[index].MaxSize());
     if (batchNum == _freeList[index].MaxSize()) {
+        // The comment above calls this slow start, but += 1 is additive
+        // increase: reaching a batch of N takes N refills. TCP slow start
+        // doubles per round trip and reaches N in log2(N). For a size class
+        // refilled only a handful of times per round -- which is what an
+        // ascending size sweep produces -- additive growth never converges
+        // inside the measurement, so the list stays far too small to hold
+        // what the workload piles into it.
+        //
+        // Build with -DMAXSIZE_GROWTH_MULT for the multiplicative version.
+#ifdef MAXSIZE_GROWTH_MULT
+        size_t cap  = SizeClass::NumMoveSize(size);
+        size_t next = _freeList[index].MaxSize() * 2;
+        _freeList[index].MaxSize() = next > cap ? cap : next;
+#else
         _freeList[index].MaxSize() += 1;
+#endif
     }
 
     void* start = nullptr;
