@@ -80,7 +80,8 @@ allocates a handful of objects never pays for a large transfer; a thread in a ho
 loop converges on large ones. Same idea as TCP slow start.
 
 **Size classes trade a little memory for a lot of speed.** 208 classes with
-alignment that widens as sizes grow, so the worst-case waste stays near 12%:
+alignment that widens as sizes grow, so that rounding a request up to its class
+wastes at most ~11% of the block **for requests above 128 bytes**:
 
 ```
      1 ..   128 B   ->  8 B alignment    16 classes
@@ -93,6 +94,29 @@ alignment that widens as sizes grow, so the worst-case waste stays near 12%:
 
 Rounding to a class is a couple of shifts, so both `Index` and `RoundUp` are
 branch-on-magnitude then arithmetic — no search.
+
+Two things that bound is *not*, because both are easy to read into it:
+
+- **It does not hold at the bottom of the range.** An 8-byte quantum on a 1-byte
+  request wastes 87.5%. The ~11% figure is the worst case within each band
+  *above* 128 bytes (10.4%, 11.0%, 11.1%, 11.1% respectively).
+- **It is not this allocator's memory overhead.** It bounds the gap *inside* a
+  block that has been handed to the application. It says nothing about memory the
+  allocator is holding and has not handed out, which is where the footprint
+  actually goes. On the `ramp/interleaved` workload the two differ by three orders
+  of magnitude:
+
+  | | |
+  | --- | --- |
+  | live application data (256 objects, mean 3 574 B) | **0.87 MB** |
+  | of which rounding waste (measured, 1.5% here) | 0.04 MB |
+  | libmalloc's peak RSS for the same work | 7 MB — **8x** live |
+  | **this allocator's peak RSS** | **137 MB — 157x live** |
+
+  A few times the live set is normal for an allocator; libmalloc is at 8x. 157x is
+  the retention problem in Finding 6 — free lists that never shrink, spans pinned
+  by a single live object, and a PageCache that returns nothing under 1 MB. None of
+  that is rounding, and no size-class tuning would fix it.
 
 ### Spans, and how a pointer finds its way home
 
