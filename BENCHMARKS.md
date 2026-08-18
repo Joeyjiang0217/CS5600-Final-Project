@@ -1344,6 +1344,230 @@ retraction of section Q still stands — real tcmalloc does solve `ramp/interlea
 at 1.60 ms — but the reason the macOS figure understated it was only partly the
 shim.
 
+## W. The granularity experiment — matching libmalloc's 512-byte quantisation
+
+Section K established that half of the one loss belongs to libmalloc: from 1 KB to
+8 KB it quantises to 512 bytes and we quantise to 128, so the ramp lingers 4x
+longer in each of its buckets. That was a measurement of libmalloc, not a claim
+about us — nothing tested whether *our* granularity is causal. This section tests
+it by changing ours to match.
+
+`Common.h` now carries a compile-time knob:
+
+```bash
+# 7 is the original 128-byte alignment; 9 is libmalloc's 512
+c++ -std=c++14 -O2 -DNDEBUG -pthread -DMID_ALIGN_SHIFT=9 \
+    -o bench512 main.cpp CentralCache.cpp PageCache.cpp ThreadCache.cpp
+```
+
+It moves three things that have to move together: `RoundUp`'s third branch,
+`Index`'s alignment shift and group count, and `NFREELISTS`.
+
+| | classes, 1 KB–8 KB | mean dwell | `NFREELISTS` | mean rounding waste, 1..8192 |
+| --- | --- | --- | --- | --- |
+| `MID_ALIGN_SHIFT=7` (128 B) | 56 | 128 sizes | 208 | 2.11% |
+| `MID_ALIGN_SHIFT=9` (512 B) | 14 | 512 sizes | 166 | 7.19% |
+
+### Two gates before any timing
+
+**A class-map invariant gate.** `verify.cpp` checks allocator *behaviour*; it does
+not check the table that behaviour rests on. An off-by-one in `Index` under a
+changed shift either indexes past `_freeList[]` or silently merges two classes,
+and neither is guaranteed to corrupt a stamp. The gate walks every size in
+1..256 KB and asserts: `RoundUp` never rounds down, is idempotent, a size and its
+representative land in the same index, `Index` is monotonic and stays below
+`NFREELISTS`, and the span for each class fits `NPAGES`. Both configurations pass,
+and in both the maximum index used is exactly `NFREELISTS - 1` — no slack, no
+overflow.
+
+**A behaviour-neutrality control.** The knob defaults to 7, so it must be a no-op
+at that setting. Built from the pre-patch `Common.h`, `ramp/interleaved` peak RSS
+over five processes was 177–189 MB, median 184.4; the patched build at shift 7 gives
+185.9 MB median. Same distribution, so the shift-7 column is the old allocator.
+
+`verify.cpp --alloc mine --all` passes under both shifts, and `--alloc broken`
+still fails (59 667 checks) under shift 9 — the gate is real on the new build too.
+
+### Throughput — the one loss becomes a win
+
+4 threads, medians of **15 independent processes**, speedup against libmalloc:
+
+| workload | 128 B | 512 B | our own time |
+| --- | --- | --- | --- |
+| `fixed/interleaved` | 2.17x [1.99–2.26] | 2.10x [2.01–2.41] | 0.91 → 0.89 ms |
+| **`ramp/interleaved`** | **0.79x [0.57–0.84]** | **1.25x [1.20–1.36]** | **3.43 → 2.11 ms** |
+| `ramp/bulk` | 4.57x [3.81–5.26] | 3.49x [3.17–3.74] | 4.91 → 6.61 ms |
+| `fixed/bulk` | 0.71x [0.65–0.85] | 0.67x [0.62–0.76] | 5.63 → 5.56 ms |
+| `classstep/interleaved` | 3.89x [3.73–4.09] | 3.85x [3.75–3.99] | 1.09 → 1.10 ms |
+| `random/interleaved` | 3.06x [2.87–3.45] | 3.55x [3.08–3.76] | 1.78 → 1.54 ms |
+
+The `ramp/interleaved` ranges **do not overlap** — [0.57–0.84] against [1.20–1.36].
+The project's only loss against libmalloc is a 1.25x win at 512-byte granularity.
+
+Its run-to-run spread also collapses: our own time goes from [3.19–5.58] to
+[2.01–2.17]. Most of the variance section F attributes to this workload was the
+drain/fill thrash, and coarser buckets remove it.
+
+**It is not a thread-count artifact** (medians of 7):
+
+| threads | 128 B | 512 B | ratio |
+| --- | --- | --- | --- |
+| 1 | 0.99x | 1.73x | 1.75x |
+| 2 | 0.86x | 1.50x | 1.74x |
+| 4 | 0.73x | 1.22x | 1.67x |
+| 8 | 0.63x | 1.00x | 1.59x |
+
+The multiplier is flat in thread count, which is what Finding 1 predicts: this is
+a fast-path effect, not a contention effect. Both configurations degrade with
+threads at the same rate, and at 8 threads the flip becomes a tie.
+
+### Memory — a 2.3x improvement nobody predicted
+
+This was expected to be the axis that paid for the win: coarser rounding wastes
+more per block. The rounding waste does rise (2.11% → 7.19% mean over the ramp
+range), and it is **irrelevant**. Peak RSS, one allocator per process, medians of
+five:
+
+| workload | 128 B | 512 B | ratio | libmalloc | 128/lib | 512/lib |
+| --- | --- | --- | --- | --- | --- | --- |
+| `fixed/interleaved` | 2.8 MB | 2.7 MB | 0.96x | 2.9 MB | 1.0x | 0.9x |
+| **`ramp/interleaved`** | **185.9 MB** | **79.5 MB** | **0.43x** | 7.6 MB | **24.5x** | **10.5x** |
+| `random/interleaved` | 71.0 MB | 45.4 MB | 0.64x | 7.4 MB | 9.6x | 6.1x |
+| `classstep/interleaved` | 94.8 MB | 57.6 MB | 0.61x | 6.0 MB | 15.8x | 9.6x |
+| `ramp/bulk` | 257.2 MB | 198.2 MB | 0.77x | 122.4 MB | 2.1x | 1.6x |
+| `fixed/bulk` | 3.7 MB | 3.5 MB | 0.95x | 3.9 MB | 1.0x | 0.9x |
+
+Minor faults per 1 000 operations fall with it: `ramp/interleaved` 16.0 → 4.2
+(libmalloc 0.5), `ramp/bulk` 9.8 → 1.4 (libmalloc 216.4).
+
+The reason the waste does not matter is that it is per-block and the hoarding is
+per-class. Cutting 56 classes to 14 removes 42 sets of free lists that only ever
+grow and 42 spans that one live object can pin — which is Finding 6's causes 1 and
+2, attacked from an angle that has nothing to do with reclamation. **This is the
+first change in the project that improves memory at all.**
+
+### Tail latency also improves, 3.9x
+
+`ramp/interleaved`, alloc, medians of five runs (ns):
+
+| build | p50 | p90 | p99 | p99.9 | max |
+| --- | --- | --- | --- | --- | --- |
+| 128 B | 0 | 27 | 360 | **2 169** | 28 527 |
+| 512 B | 0 | 28 | 277 | **563** | 7 444 |
+| libmalloc | 26 | 27 | 110 | 236 | 1 028 |
+
+We go from 9.2x libmalloc's p99.9 to 2.9x. Read p50/p90 with care: the two runs
+calibrated clock overhead at 27.4 and 17.3 ns, which is the whole size of the
+figure being reported. The tail is not sensitive to a 10 ns offset.
+
+### Mechanism — and a prediction the model got right in advance
+
+Section E's exact command, `--reps 1 --only mine`, 4 threads:
+
+| build | fast path | refills | flushes | central trips /1k | spans carved |
+| --- | --- | --- | --- | --- | --- |
+| 128 B | 95.11% | 21 510 | 13 398 | **87.3** | 781 |
+| 512 B | 97.25% | 12 087 | 8 027 | **50.3** | 529 |
+
+The shift-7 row reproduces section E to within 0.5% (21 401 / 13 336 / 86.8 there),
+so the instrumented build and the documented baseline agree.
+
+Central trips fall **1.74x**, not the 4x that "4x coarser buckets" suggests — the
+pile that has to be flushed is `min(W, dwell)` and `W = 64` binds in both
+configurations, so coarsening does not shrink the pile, only the number of times
+the cycle restarts.
+
+Now feed those trip counts into the cost model section E fitted — `a ≈ 2 ns` per
+allocation, `b ≈ 70 ns` per central trip — which was fitted **before this
+configuration existed**:
+
+| build | predicted | measured | error |
+| --- | --- | --- | --- |
+| 128 B | 3.24 ms | 3.43 ms | −5.4% |
+| 512 B | **2.21 ms** | **2.11 ms** | **+4.6%** |
+
+A model fitted on two points at 128-byte granularity predicts the 512-byte time to
+4.6%, against the −25% error it posted on its own held-out row. The mechanism is
+not merely consistent with the win; it forecast its size.
+
+### What it costs: span recycling churn on `bulk` and `cross`
+
+Two workloads regress, by the same factor:
+
+| workload | 128 B | 512 B | ratio |
+| --- | --- | --- | --- |
+| `ramp/bulk` | 4.57x | 3.49x | **0.76x** |
+| `ramp/cross` | 2.37x | 1.79x | **0.76x** |
+| `fixed/cross` | 0.82x | 0.83x | 1.01x |
+
+(`cross` medians of 7 — these also replace the single measurements section T
+flagged as a limitation.)
+
+The counter that moves the wrong way is `spansCarved`, and it moves *against* RSS:
+`ramp/bulk` carves 1.7x **more** spans while holding 23% **less** memory. Those are
+the same fact. With four times fewer classes each class owns four times more of the
+live objects, so a span is far more likely to drain completely, return to
+`PageCache`, and be re-carved next round — instead of sitting pinned by one
+survivor. Recycling is why RSS falls; re-carving is why `bulk` slows down.
+
+It scales with rounds, which is the test that separates it from a fixed cost
+(`--reps 1 --warmup 0`, spans carved):
+
+| rounds | 128 B | 512 B |
+| --- | --- | --- |
+| 1 | 1 059 | 1 012 |
+| 2 | 1 444 | 1 523 |
+| 10 | 3 249 | **5 107** |
+
+And the throughput follows it (warm config, medians of 7): `ramp/bulk` is a tie at
+`--rounds 1` (1.02x), then settles at 0.63x / 0.73x / 0.71x / 0.73x for rounds
+2, 5, 10, 20. One round has no recycling to do and no penalty to pay.
+
+*An earlier read of this said 512 bytes was 1.79x faster at `--rounds 1`. That was
+a cold-start artifact of measuring at `--reps 1 --warmup 0`; the warm median is a
+tie. Same trap as retraction 8 in the notes below.*
+
+### Verdict
+
+The third attempt at the one loss, and the first that is net positive:
+
+| axis | effect |
+| --- | --- |
+| `ramp/interleaved` throughput | **0.79x → 1.25x**, ranges disjoint |
+| `ramp/interleaved` peak RSS | **24.5x → 10.5x** libmalloc |
+| `ramp/interleaved` p99.9 | **2 169 → 563 ns** |
+| run-to-run spread on that workload | collapses |
+| `ramp/bulk`, `ramp/cross` throughput | **0.76x** |
+| `fixed/*`, `classstep/*` | flat |
+| rounding waste | 2.11% → 7.19% mean — measurable, irrelevant |
+
+Sections N and O each moved one axis and lost more on another. This moves three
+axes favourably and costs one, and the cost is concentrated in the workloads whose
+win was largest to begin with — `ramp/bulk` at 3.49x is still the second-biggest
+margin in the project.
+
+**It is left off by default.** Every number elsewhere in this file and in the
+README was measured at 128 bytes, and flipping the default would silently
+invalidate all of them. The knob makes the result reproducible without that.
+
+### Two documented figures that did not reproduce
+
+Found while establishing the baseline for this section, and not caused by it —
+both reproduce as *single samples* but not as medians:
+
+- **Section D's `ramp/interleaved` peak RSS, 131 408 KiB.** Current code at
+  4 threads gives 185.9 MB, median of five, spread 177–189 MB across every run
+  taken here. Checked and ruled
+  out: the pre-patch source measures the same (so this section's knob is not the
+  cause), no thread count in 1/2/3/4/8 produces 131 MB, `--warmup` does not
+  explain it, and the allocator's logic is unchanged since that commit — the only
+  diff to `ThreadCache.cpp` is `ALLOC_STATS` instrumentation that compiles to
+  nothing. The likely cause is the `main.cpp` rewrite between those commits. The
+  documented **11.58x** against libmalloc reads **24.5x** today, so Finding 6
+  understates the defect rather than overstating it.
+- **Section G's `ramp/interleaved` p99.9 of 9 842 ns.** The median of five runs is
+  2 169 ns. The direction of that finding holds; the magnitude was a tail sample.
+
 ## Notes on method
 
 - **Wall clock, not summed thread time.** An earlier harness accumulated each

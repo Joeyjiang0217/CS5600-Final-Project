@@ -25,7 +25,25 @@ using std::cout;
 using std::endl;
 
 static const size_t MAX_BYTES = 256 * 1024;
-static const size_t NFREELISTS = 208;
+
+// EXPERIMENT KNOB -- the alignment used for the 1 KB .. 8 KB range.
+//
+// 7 (128 bytes) is the original. libmalloc quantises that same range to 512
+// bytes -- measured directly with malloc_size, BENCHMARKS.md section K -- and
+// that 4x coarser granularity is half of why it beats us on ramp/interleaved:
+// the ramp lingers 4x longer in each bucket, so the drain/fill penalty is
+// spread over 4x more allocations. Building with -DMID_ALIGN_SHIFT=9 matches
+// its granularity, which turns that mechanism from plausible into testable.
+#ifndef MID_ALIGN_SHIFT
+#define MID_ALIGN_SHIFT 7
+#endif
+static const size_t MID_ALIGN = (size_t)1 << MID_ALIGN_SHIFT;
+
+// Classes per alignment group: 128/8, (1024-128)/16, (8192-1024)/MID_ALIGN,
+// (64K-8K)/1K, (256K-64K)/8K. The knob moves only the third term -- 56 classes
+// at 128-byte alignment, 14 at 512 -- so NFREELISTS has to follow it.
+static const size_t NCLASS_MID = 7168 >> MID_ALIGN_SHIFT;
+static const size_t NFREELISTS = 16 + 56 + NCLASS_MID + 56 + 24;
 static const size_t NPAGES = 129;
 static const size_t PAGE_SHIFT = 13; // 8KB
 
@@ -184,7 +202,7 @@ public:
         }
         else if (size <= 8 * 1024)
         {
-            return _RoundUp(size, 128);
+            return _RoundUp(size, MID_ALIGN);
         }
         else if (size <= 64 * 1024)
         {
@@ -209,7 +227,7 @@ public:
     {
         assert(bytes <= MAX_BYTES);
 
-        static int group_array[4] = { 16, 56, 56, 56 };
+        static const size_t group_array[4] = { 16, 56, NCLASS_MID, 56 };
         if (bytes <= 128){
             return _Index(bytes, 3);
         }
@@ -220,7 +238,7 @@ public:
         }
         else if (bytes <= 8 * 1024)
         {
-            return _Index(bytes - 1024, 7) + group_array[1] + group_array[0];
+            return _Index(bytes - 1024, MID_ALIGN_SHIFT) + group_array[1] + group_array[0];
         }
         else if (bytes <= 64*1024)
         {
