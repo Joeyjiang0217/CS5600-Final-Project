@@ -8,16 +8,8 @@
 #include "ThreadCache.h"
 #include "PageCache.h"
 
-// These are static functions in a header, so at -O2 the whole fast path inlines
-// into the caller. malloc is a cross-library call that never can. Build with
-// -DALLOC_NOINLINE to measure how much of the advantage that accounts for.
-#ifdef ALLOC_NOINLINE
-  #define ALLOC_ATTR __attribute__((noinline))
-#else
-  #define ALLOC_ATTR
-#endif
 
-static ALLOC_ATTR void* ConcurrentAlloc(size_t size) {
+static void* ConcurrentAlloc(size_t size) {
     // Handle large allocations directly through PageCache
     if (size > MAX_BYTES) {
         size_t alignedSize = SizeClass::RoundUp(size);
@@ -40,7 +32,7 @@ static ALLOC_ATTR void* ConcurrentAlloc(size_t size) {
     return pTLSThreadCache->Allocate(size);
 }
 
-static ALLOC_ATTR void ConcurrentFree(void* ptr) {
+static void ConcurrentFree(void* ptr) {
     Span* span = PageCache::GetInstance()->MapObjectToSpan(ptr);
     size_t size = span->_objSize;
 

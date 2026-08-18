@@ -114,18 +114,6 @@ public:
         return _maxSize;
     }
 
-    // One number cannot express three different quantities. _maxSize is the
-    // refill batch (a transfer-cost decision, rightly bounded by NumMoveSize),
-    // the flush threshold (a cache-capacity decision, which has nothing to do
-    // with transfer size), and the flush amount (which should leave a working
-    // set behind rather than empty the list). -DDECOUPLED_LISTS splits them.
-#ifdef DECOUPLED_LISTS
-    size_t& Capacity()
-    {
-        return _capacity;
-    }
-#endif
-
     void PushRange(void* start, void* end, size_t n)
     {
         assert(start != nullptr && end != nullptr);
@@ -164,9 +152,6 @@ private:
     void* _freelist = nullptr;
     size_t _maxSize = 1;
     size_t _size = 0;
-#ifdef DECOUPLED_LISTS
-    size_t _capacity = 1;    // high-water mark, grown independently of _maxSize
-#endif
 };
 
 

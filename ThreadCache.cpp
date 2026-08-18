@@ -31,22 +31,7 @@ void* ThreadCache::FetchFromCentralCache(size_t index, size_t size) {
     if (size >= 1024) { STAT_INC(bigRefills); STAT_ADD(bigMaxSizeSum, _freeList[index].MaxSize()); }
     size_t batchNum = (std::min)(SizeClass::NumMoveSize(size), _freeList[index].MaxSize());
     if (batchNum == _freeList[index].MaxSize()) {
-        // The comment above calls this slow start, but += 1 is additive
-        // increase: reaching a batch of N takes N refills. TCP slow start
-        // doubles per round trip and reaches N in log2(N). For a size class
-        // refilled only a handful of times per round -- which is what an
-        // ascending size sweep produces -- additive growth never converges
-        // inside the measurement, so the list stays far too small to hold
-        // what the workload piles into it.
-        //
-        // Build with -DMAXSIZE_GROWTH_MULT for the multiplicative version.
-#ifdef MAXSIZE_GROWTH_MULT
-        size_t cap  = SizeClass::NumMoveSize(size);
-        size_t next = _freeList[index].MaxSize() * 2;
-        _freeList[index].MaxSize() = next > cap ? cap : next;
-#else
         _freeList[index].MaxSize() += 1;
-#endif
     }
 
     void* start = nullptr;
@@ -93,16 +78,9 @@ void ThreadCache::Deallocate(void* ptr, size_t size) {
     _freeList[index].Push(ptr);
 
     // Check if the free list is too long
-#ifdef DECOUPLED_LISTS
-    // Threshold is the independent capacity, not the transfer batch.
-    if (_freeList[index].Size() >= _freeList[index].Capacity()) {
-        ListTooLong(_freeList[index], alignedSize);
-    }
-#else
     if (_freeList[index].Size() >= _freeList[index].MaxSize()) {
         ListTooLong(_freeList[index], alignedSize);
     }
-#endif
 }
 
 void ThreadCache::ListTooLong(FreeList& list, size_t size) {
@@ -110,23 +88,6 @@ void ThreadCache::ListTooLong(FreeList& list, size_t size) {
     void* start = nullptr;
     void* end = nullptr;
     STAT_INC(listReturns);
-#ifdef DECOUPLED_LISTS
-    // Hysteresis: flush down to half the capacity instead of emptying the list.
-    // Popping exactly the threshold leaves nothing behind, so the very next
-    // allocation of this class has to go back to CentralCache -- a flush
-    // immediately followed by a refill.
-    size_t keep = list.Capacity() / 2;
-    size_t n = list.Size() > keep ? list.Size() - keep : list.Size();
-    list.PopRange(start, end, n);
-
-    // A flush means the pile did not fit, so capacity was too small. Grow it.
-    // Bounded at 2x NumMoveSize: capacity is a memory decision, so it needs
-    // *a* bound, just not the transfer-size bound that MaxSize() carries.
-    size_t cap = 2 * SizeClass::NumMoveSize(size);
-    size_t next = list.Capacity() * 2;
-    list.Capacity() = next > cap ? cap : next;
-#else
     list.PopRange(start, end, list.MaxSize());
-#endif
     CentralCache::GetInstance()->ReleaseListToSpans(start, size);
 }
