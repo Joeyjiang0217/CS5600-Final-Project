@@ -14,6 +14,9 @@ std::atomic<size_t> AllocStats::listReturns{0};
 std::atomic<size_t> AllocStats::spansCarved{0};
 std::atomic<size_t> AllocStats::maxSizeSum{0};
 std::atomic<size_t> AllocStats::distinctClassRefills{0};
+std::atomic<size_t> AllocStats::bigRefills{0};
+std::atomic<size_t> AllocStats::bigMaxSizeSum{0};
+std::atomic<size_t> AllocStats::bigBatchSum{0};
 #endif
 
 void* ThreadCache::FetchFromCentralCache(size_t index, size_t size) {
@@ -25,6 +28,7 @@ void* ThreadCache::FetchFromCentralCache(size_t index, size_t size) {
     // 3. The larger the size, the smaller the batchNum requested from the central cache at one time.
     // 4. The smaller the size, the larger the batchNum requested from the central cache at one time.
     STAT_ADD(maxSizeSum, _freeList[index].MaxSize());
+    if (size >= 1024) { STAT_INC(bigRefills); STAT_ADD(bigMaxSizeSum, _freeList[index].MaxSize()); }
     size_t batchNum = (std::min)(SizeClass::NumMoveSize(size), _freeList[index].MaxSize());
     if (batchNum == _freeList[index].MaxSize()) {
         _freeList[index].MaxSize() += 1;
@@ -41,6 +45,7 @@ void* ThreadCache::FetchFromCentralCache(size_t index, size_t size) {
     // fell off the end of the function when actualNum was 0, which the assert
     // above only catches while asserts are enabled.
     STAT_ADD(objsFetched, actualNum);
+    if (size >= 1024) { STAT_ADD(bigBatchSum, actualNum); }
     if (actualNum > 1) {
         assert(start != end);
         _freeList[index].PushRange(NextObj(start), end, actualNum - 1);

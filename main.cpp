@@ -61,7 +61,7 @@ static size_t PeakRssKiB() {
 
 // ------------------------------------------------------------------ workloads
 
-enum class SizeMode { Fixed16, Ramp, Random, Large };
+enum class SizeMode { Fixed16, Ramp, Random, Large, ClassStep };
 enum class Pattern  { BulkThenFree, Interleaved, CrossThread };
 
 struct Config {
@@ -83,6 +83,21 @@ struct Config {
 // sizes in order, which is close to the best case for a size-class allocator.
 // Random draws from the same range with a real generator so the two can be
 // compared directly.
+// The size-class representatives for 1..8192, in order: 8,16,..,128 then
+// 144,160,..,1024 then 1152,1280,..,8192. Walking this one entry per iteration
+// puts every allocation in a *different* class, i.e. dwell = 1 -- the extreme
+// case of the W/dwell model that `ramp` explores at dwell = 128.
+static const std::vector<size_t>& ClassSizes() {
+    static std::vector<size_t> v = [] {
+        std::vector<size_t> t;
+        for (size_t s = 8;    s <= 128;  s += 8)   t.push_back(s);
+        for (size_t s = 144;  s <= 1024; s += 16)  t.push_back(s);
+        for (size_t s = 1152; s <= 8192; s += 128) t.push_back(s);
+        return t;
+    }();
+    return v;
+}
+
 static inline size_t SizeFor(SizeMode m, size_t i, std::mt19937& rng) {
     switch (m) {
         case SizeMode::Fixed16: return 16;
@@ -91,6 +106,10 @@ static inline size_t SizeFor(SizeMode m, size_t i, std::mt19937& rng) {
         // Above MAX_BYTES (256 KB) requests bypass ThreadCache entirely and go
         // straight to PageCache. The original benchmark never reached this path.
         case SizeMode::Large:   return 256 * 1024 + (rng() % (64 * 1024)) + 1;
+        case SizeMode::ClassStep: {
+            const std::vector<size_t>& cs = ClassSizes();
+            return cs[i % cs.size()];
+        }
     }
     return 16;
 }
@@ -343,6 +362,7 @@ static const char* SizeModeName(SizeMode m) {
         case SizeMode::Ramp:    return "ramp-1B..8KB";
         case SizeMode::Random:  return "random-1B..8KB";
         case SizeMode::Large:   return "large-256KB+";
+        case SizeMode::ClassStep: return "classstep-dwell1";
     }
     return "?";
 }
@@ -377,6 +397,7 @@ int main(int argc, char** argv) {
             else if (v == "ramp")   cfg.sizeMode = SizeMode::Ramp;
             else if (v == "random") cfg.sizeMode = SizeMode::Random;
             else if (v == "large")  cfg.sizeMode = SizeMode::Large;
+            else if (v == "classstep") cfg.sizeMode = SizeMode::ClassStep;
             else { fprintf(stderr, "unknown --size %s\n", v.c_str()); return 2; }
         }
         else if (a == "--pattern") {
@@ -403,7 +424,7 @@ int main(int argc, char** argv) {
                    "  --rounds N      rounds per thread (default 10)\n"
                    "  --ntimes N      allocations per round (default 10000)\n"
                    "  --reps N        repetitions for median/stddev (default 5)\n"
-                   "  --size MODE     fixed | ramp | random | large (default ramp)\n"
+                   "  --size MODE     fixed | ramp | random | large | classstep (default ramp)\n"
                    "  --pattern MODE  bulk | interleaved | cross (default bulk)\n"
                    "  --seed N        RNG seed (default 12345)\n"
                    "  --latency       per-call latency percentiles instead of throughput\n"

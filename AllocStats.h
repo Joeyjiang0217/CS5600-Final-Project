@@ -21,11 +21,15 @@ struct AllocStats {
     static std::atomic<size_t> spansCarved;   // PageCache::NewSpan calls
     static std::atomic<size_t> maxSizeSum;    // sum of MaxSize() at each refill
     static std::atomic<size_t> distinctClassRefills;
+    static std::atomic<size_t> bigRefills;      // refills for size >= 1024
+    static std::atomic<size_t> bigMaxSizeSum;   // MaxSize() at those refills
+    static std::atomic<size_t> bigBatchSum;     // objects actually returned
 
     static void Reset() {
         fastHits = 0; slowFetches = 0; objsFetched = 0;
         listReturns = 0; spansCarved = 0; maxSizeSum = 0;
         distinctClassRefills = 0;
+        bigRefills = 0; bigMaxSizeSum = 0; bigBatchSum = 0;
     }
 
     static void Dump(const char* tag) {
@@ -38,6 +42,11 @@ struct AllocStats {
                "avg_MaxSize %7.2f  spans %6zu  flushes %8zu\n",
                tag, hitRate, slow, avgBatch, avgMaxSize,
                spansCarved.load(), listReturns.load());
+        size_t br = bigRefills.load();
+        if (br) {
+            printf("%-28s  size>=1KB: refills %zu  avg_MaxSize %.1f  avg_batch %.1f\n",
+                   "", br, (double)bigMaxSizeSum.load()/br, (double)bigBatchSum.load()/br);
+        }
     }
 };
 

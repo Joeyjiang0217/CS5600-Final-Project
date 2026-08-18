@@ -505,6 +505,70 @@ At `W = 4` traffic falls to 18.2 — the same as `random` — and this allocator
 is.** The losing band is roughly `16 <= W <= 256`, and it closes again at large
 `W` only because libmalloc also degrades there (2.53 -> 4.55 ms).
 
+## M. The W/dwell model was wrong. The driver is pile size vs MaxSize
+
+Section L proposed that forced central traffic scales with `W / dwell`, and
+predicted that `dwell = 1` -- every allocation in a different size class -- would
+be the worst case. **It is very nearly the best case.**
+
+`--size classstep` walks one size-class representative per iteration (8, 16, ...,
+128, 144, ..., 1024, 1152, ..., 8192, then repeats), so `dwell = 1`.
+`interleaved`, `W = 64`, 4 threads:
+
+| size mode | dwell | central trips /1k | fast path | ours (ms) | speedup |
+| --- | --- | --- | --- | --- | --- |
+| fixed 16 B | infinite | 0.8 | 99.96% | 1.24 | 2.24x |
+| random | n/a | 18.6 | 98.87% | 1.93 | 3.05x |
+| ramp | 128 | **87.4** | 95.11% | 4.27 | **0.69x** |
+| **classstep** | **1** | **2.6** | 99.77% | 1.11 | **4.05x** |
+
+### The corrected mechanism
+
+What matters is not the ratio `W / dwell`. It is **how many objects of one size
+class sit in that class's free list while allocation has moved on -- the "pile" --
+compared to `MaxSize()`**:
+
+- **pile <= MaxSize** — the objects wait in the thread-local list and are handed
+  back out on the class's next visit. They never leave the thread.
+- **pile >> MaxSize** — `ListTooLong` flushes them to CentralCache, and the next
+  visit has to fetch them back. Two central trips per `MaxSize` objects.
+
+Pile size per class:
+
+| size mode | pile | vs MaxSize (~19) | trips /1k |
+| --- | --- | --- | --- |
+| fixed | ~0 (alloc and free are always the same class) | under | 0.8 |
+| classstep | ~max(1, W / 128 classes) = 1 | under | 2.6 |
+| random | ~W / 130 classes ~ 0.5 | under | 18.6 |
+| ramp | ~min(W, dwell) = 64 | **3x over** | 87.4 |
+
+### The test that separates the two models
+
+`W / dwell` predicts `classstep` should get worse with `W` just like `ramp` does.
+Pile-vs-MaxSize predicts `classstep` is **flat** in `W` until `W` approaches the
+number of classes, because its pile is 1 regardless.
+
+| `--window` | classstep trips /1k | ramp trips /1k |
+| --- | --- | --- |
+| 4 | 2.6 | 18.2 |
+| 16 | 2.6 | 62.4 |
+| 64 | **2.6** | 87.1 |
+| 256 | 9.0 | 110.3 |
+| 1 024 | 31.0 | 110.2 |
+
+Flat at 2.6 across a 16x range of `W`, then rising once `W` exceeds the 128-class
+cycle and each class starts holding `W / 128` objects. `ramp` meanwhile climbs
+monotonically and saturates at its dwell. The pile model fits all ten points;
+`W / dwell` fits neither column.
+
+### What this implies
+
+The loss is not about ascending sizes, and not about the live set. It is about
+**`MaxSize()` being too small for the pile the workload creates** — which points
+at the same design flaw noted in section E, `MaxSize()` serving as both the refill
+batch and the flush threshold. Raising the flush threshold above the pile, or
+decoupling the two, is the fix the model predicts. Untested so far.
+
 ## Notes on method
 
 - **Wall clock, not summed thread time.** An earlier harness accumulated each
