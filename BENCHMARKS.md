@@ -323,6 +323,50 @@ index *within a round*, so shrinking `ntimes` also shortens the ramp and narrows
 the number of size classes touched. The table above uses `--size random`, whose
 size does not depend on `i`, which is why it is the one to read.
 
+## J. The baseline per-call advantage, and what it is not
+
+With page faults near zero and central traffic minimal, what is left is the cost
+of the fast path itself. The cleanest configuration for that is
+`fixed/interleaved`: **99.96% fast path**, 0.8 central trips per 1 000
+allocations, no page faults. It runs at roughly **2x** (1.9-2.7x across runs).
+
+`random/bulk` at a 100-object live set gives 2.10x but is not as clean -- 99.25%
+fast path and 11.2 central trips per 1 000, 14x more shared-layer traffic.
+
+### It is not inlining
+
+`ConcurrentAlloc` is a `static` function in a header, so at -O2 the entire fast
+path can inline into the caller. `malloc` is a cross-library call that cannot.
+That seemed likely to account for a chunk of the advantage. Build with
+`-DALLOC_NOINLINE` to force `__attribute__((noinline))` on both entry points and
+it does not:
+
+| build | speedup, 5 fresh processes | median |
+| --- | --- | --- |
+| default (inlinable) | 1.99 2.15 2.39 2.10 2.06 | 2.10x |
+| `-DALLOC_NOINLINE` | 1.89 1.96 2.13 2.07 2.15 | 2.07x |
+
+A 1.5% difference, well inside the noise. Call overhead is not where the 2x comes
+from.
+
+### What is left
+
+Two candidates remain, and this harness cannot separate them without profiling
+libmalloc's internals:
+
+- **No atomics.** This allocator's free list is genuinely thread-private, so a
+  pop is a plain load, load, store. macOS's nano zone keeps per-CPU magazines,
+  which a migrating thread can race, so its fast path needs an atomic
+  compare-exchange -- considerably more than a plain store on arm64.
+- **A narrower contract.** `malloc` has to handle `malloc(0)`, guarantee 16-byte
+  alignment, dispatch through `malloc_zone_t`, support `malloc_size`,
+  interposition and debug hooks. `ConcurrentAlloc` does none of that, which is
+  also why it is not a drop-in replacement.
+
+**Keep the absolute scale in view.** 2x on an operation that costs about 2 ns is
+about 1 ns per call. It only shows up in allocation-dominated loops; a program
+that does real work between allocations will not notice it.
+
 ## Notes on method
 
 - **Wall clock, not summed thread time.** An earlier harness accumulated each
