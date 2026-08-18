@@ -73,6 +73,7 @@ struct Config {
     Pattern  pattern  = Pattern::BulkThenFree;
     unsigned seed     = 12345;
     size_t   latStride = 64;    // mean gap between latency samples
+    size_t   warmup    = 1;     // discarded rounds before measuring
 };
 
 // Returns the request size for iteration `i`.
@@ -370,6 +371,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--latency")    latency = true;
         else if (a == "--lat-stride") cfg.latStride = std::stoul(next());
+        else if (a == "--warmup")     cfg.warmup = std::stoul(next());
         else if (a == "--only") {
             std::string v = next();
             if      (v == "mine") { runMine = true;  runSys = false; }
@@ -388,6 +390,7 @@ int main(int argc, char** argv) {
                    "  --seed N        RNG seed (default 12345)\n"
                    "  --latency       per-call latency percentiles instead of throughput\n"
                    "  --lat-stride N  mean gap between latency samples (default 64)\n"
+                   "  --warmup N      discarded rounds before measuring (default 1)\n"
                    "  --csv           machine-readable output\n", argv[0]);
             return 0;
         }
@@ -409,9 +412,8 @@ int main(int argc, char** argv) {
 
         // Warm up, then collect. Sampling perturbs throughput, so this mode
         // deliberately reports no speedup -- the two are measured separately.
-        Config warm = cfg; warm.rounds = 1;
-        RunOnce(warm, Mine, MineFree);
-        RunOnce(warm, Sys, SysFree);
+        Config warm = cfg; warm.rounds = cfg.warmup;
+        if (cfg.warmup) { RunOnce(warm, Mine, MineFree); RunOnce(warm, Sys, SysFree); }
 
         std::vector<LatencyData> lmine(cfg.nworks), lsys(cfg.nworks);
         RunOnce(cfg, Mine, MineFree, &lmine);
@@ -446,9 +448,9 @@ int main(int argc, char** argv) {
     // One discarded warm-up pass each. The first pass pays for lazily created
     // ThreadCaches, page-map nodes, and first-touch page faults, none of which
     // recur; leaving it in the sample is most of why the variance was large.
-    {
+    if (cfg.warmup) {
         Config warm = cfg;
-        warm.rounds = 1;
+        warm.rounds = cfg.warmup;
         if (runMine) RunOnce(warm, Mine, MineFree);
         if (runSys)  RunOnce(warm, Sys, SysFree);
     }

@@ -215,6 +215,67 @@ the same behaviour that makes it use 11x less memory in section D. This allocato
 never returns memory below 1 MB, so it never pays that spike. **Memory footprint
 and tail latency are the same trade-off seen from two sides.**
 
+## H. Warm-up sensitivity
+
+The ramp keeps converging for a long time. Counters per round, `--only mine`,
+`ramp/interleaved`, 4 threads:
+
+| rounds | refills / round | spans carved / round | fast path |
+| --- | --- | --- | --- |
+| 1 | 10 287 | 762 | 87.1% |
+| 5 | 3 327 | 173 | 93.1% |
+| 20 | 1 362 | 46 | 96.8% |
+| 50 | 825 | 20 | 98.0% |
+
+Span carving drops **38x** per round between 1 and 50 rounds: `MaxSize()` grows
+one step per refill per size class, so batches widen and refills thin out, and
+PageCache accumulates spans it can split instead of calling `mmap`.
+
+### Does that mean the ramp deficit is a cold-start artifact?
+
+Partly. Measured work held fixed at 10 rounds, varying only `--warmup`, **each
+data point five separate process launches** (the allocator is a global singleton,
+so state otherwise accumulates across repetitions and confounds this):
+
+| `--warmup` | speedup, 5 fresh processes | median |
+| --- | --- | --- |
+| 0 | 0.24 0.46 0.23 0.32 0.32 | **0.32x** |
+| 1 | 0.39 0.83 1.01 0.58 0.57 | 0.58x |
+| 5 | 1.06 0.79 1.24 1.01 1.27 | 1.06x |
+| 20 | 0.79 0.83 0.78 0.92 0.61 | 0.79x |
+| 50 | 0.73 0.67 0.63 0.75 0.88 | 0.73x |
+| 100 | 0.72 1.12 0.71 0.85 1.57 | 0.85x |
+| 300 | 0.36 0.61 0.70 0.76 0.66 | 0.66x |
+
+- **Truly cold is much worse**: `--warmup 0` spans 0.23–0.46 and does not overlap
+  any warmed configuration. Starting from nothing, this allocator is ~3x slower
+  than libmalloc on this workload.
+- **Beyond one warm-up round the effect is inside the noise.** Every row from 5
+  upward overlaps every other. There is no clean convergence past 1.0.
+
+An earlier version of this measurement appeared to show the speedup climbing to
+1.42x at 100 rounds. That did not reproduce in fresh processes — it came from
+allocator state accumulating across `--reps`, which makes later repetitions
+warmer than earlier ones.
+
+**All figures elsewhere in this file use `--warmup 1`.**
+
+### The tail gap is *not* a warm-up artifact
+
+`ramp/interleaved`, alloc, ~48 000 samples:
+
+| `--warmup` | ours p99 | ours p99.9 | malloc p99 | malloc p99.9 |
+| --- | --- | --- | --- | --- |
+| 0 | 438 | 9 541 | 230 | 938 |
+| 1 | 444 | 12 271 | 193 | 694 |
+| 20 | 527 | 5 706 | 193 | 735 |
+| 100 | 359 | 3 189 | 109 | 525 |
+
+Warming helps p99.9 (12 271 → 3 189) but **malloc has the better p99 at every
+warm-up level tested**, and the gap is still 3.3x at `--warmup 100`. Once warm,
+~5% of allocations still reach CentralCache, and those calls are what p99 is made
+of. That is structural, not transient.
+
 ## Notes on method
 
 - **Wall clock, not summed thread time.** An earlier harness accumulated each

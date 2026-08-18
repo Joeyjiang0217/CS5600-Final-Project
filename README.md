@@ -315,6 +315,19 @@ is governed by the same thing as throughput: how often you fall off the fast
 path.** A whole-run standard deviation hints at that but cannot measure it, and
 on the one workload where it mattered, it pointed the wrong way.
 
+**Is this just a cold start?** Reasonable guess, and worth checking: the ramp
+converges slowly — span carving per round falls 38x between 1 and 50 rounds as
+`MaxSize()` widens and PageCache stops calling `mmap`. Holding measured work
+fixed and varying only warm-up, in fresh processes (the allocator is a global
+singleton, so state otherwise leaks across repetitions):
+**`--warmup 0` gives 0.32x**, unambiguously worse than any warmed run. So a truly
+cold start really is ~3x slower than libmalloc here. But past one warm-up round
+the differences sit inside the noise band, and **malloc has the better p99 at
+every warm-up level tested** — 359 ns against 109 ns even at `--warmup 100`.
+Warming helps p99.9 a lot and p99 not at all. Once warm, ~5% of allocations still
+reach CentralCache, and p99 is made of exactly those calls. The tail gap is
+structural.
+
 One number worth keeping: libmalloc's worst single `free` was **592 µs**. That is
 what returning memory to the OS costs — the same behaviour that makes it use 11x
 less memory in Finding 4. This allocator never returns anything under 1 MB, so it
@@ -386,6 +399,7 @@ c++ -std=c++14 -O2 -DNDEBUG -pthread -o bench \
 | `--only` | `mine` \| `sys` \| `both` — one allocator per process, for RSS |
 | `--latency` | per-call latency percentiles instead of throughput |
 | `--lat-stride N` | mean gap between latency samples (default 64) |
+| `--warmup N` | discarded rounds before measuring (default 1) |
 | `--csv` | machine-readable output |
 
 Worth building with sanitizers before trusting any timing — an allocator that is
