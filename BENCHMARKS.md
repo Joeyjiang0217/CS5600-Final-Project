@@ -866,7 +866,7 @@ The memory side is also consistent: 122 MB against 6 MB on `ramp/interleaved`, a
 
 Same code, same workloads, three baselines:
 
-| workload | Windows CRT | macOS libmalloc | glibc ptmalloc |
+| workload | Windows CRT (Win32) | macOS libmalloc | glibc ptmalloc |
 | --- | --- | --- | --- |
 | fixed/bulk | 5.3x | 1.10x | **0.31x** |
 | ramp/bulk | 22.8x | 4.22x | 5.40x |
@@ -875,7 +875,9 @@ Same code, same workloads, three baselines:
 
 **The spread across baselines is larger than the spread across workloads, and it
 flips signs.** `fixed/bulk` goes from a 5.3x win to a 3.2x loss purely by changing
-what you compare against. Any statement of the form "this allocator is Nx faster
+what you compare against. (The Windows column here is the original **Win32**
+build; section U re-measures it on x64, where the same row reads 1.35x. Section T
+carries the authoritative five-baseline table.) Any statement of the form "this allocator is Nx faster
 than malloc" is close to meaningless without naming the malloc, and this table is
 why the original 22.8x figure was the least informative number in the project.
 
@@ -976,18 +978,48 @@ Same binary, same harness, only the allocator swapped:
 
 **Real tcmalloc beats glibc on all five**, by 1.2x to 12.7x.
 
-### Us, against four baselines
+### Us, against five baselines
 
-| workload | Windows CRT | macOS libmalloc | glibc ptmalloc | **real tcmalloc** |
-| --- | --- | --- | --- | --- |
-| fixed/bulk | 5.3x | 1.10x | 0.30x | **0.26x** |
-| ramp/bulk | 22.8x | 4.22x | 5.10x | **1.29x** |
-| fixed/interleaved | — | 2.60x | 0.63x | **0.38x** |
-| ramp/interleaved | — | **0.71x** | 1.14x | **0.52x** |
-| classstep/interleaved | — | 4.05x | **9.38x** | **0.74x** |
+Windows figures are the x64 measurements from section U; the Win32 numbers this
+table used to carry (5.3x, 22.8x) came from a 32-bit build with a different page
+map and are not comparable.
 
-**Against real tcmalloc we win 1 of 5.** Against glibc, 3 of 5. Against macOS
-libmalloc, 4 of 5. Against Windows CRT, everything measured.
+| workload | Windows UCRT | macOS libmalloc | glibc ptmalloc | mimalloc | **real tcmalloc** |
+| --- | --- | --- | --- | --- | --- |
+| fixed/bulk | 1.35x | 1.10x | 0.30x | 0.24x | **0.45x** |
+| ramp/bulk | 9.52x | 4.22x | 5.10x | 1.01x | **1.43x** |
+| fixed/interleaved | 2.59x | 2.60x | 0.63x | 0.57x | **0.72x** |
+| ramp/interleaved | 1.77x | **0.71x** | 1.14x | 0.49x | **0.41x** |
+| classstep/interleaved | **22.82x** | 4.05x | **9.38x** | 0.91x | **0.74x** |
+
+Our win count falls monotonically as the baseline gets better: **5 of 5** against
+Windows UCRT, 4 of 5 against macOS libmalloc, 3 of 5 against glibc, and **1 of 5**
+against each of mimalloc and real tcmalloc — and that one, `ramp/bulk` at 1.01x
+against mimalloc, is a tie rather than a win.
+
+### The sharpest form of the cross-baseline result
+
+The same five workloads, measured on two operating systems, once against whatever
+malloc ships with the OS and once against the same build of real tcmalloc. How far
+does each ratio move between platforms?
+
+| workload | glibc | Windows UCRT | swing | tcmalloc (Linux) | tcmalloc (Win) | swing |
+| --- | --- | --- | --- | --- | --- | --- |
+| fixed/bulk | 0.30x | 1.35x | 4.5x | 0.26x | 0.45x | 1.7x |
+| ramp/bulk | 5.10x | 9.52x | 1.9x | 1.29x | 1.43x | **1.1x** |
+| fixed/interleaved | 0.63x | 2.59x | 4.1x | 0.38x | 0.72x | 1.9x |
+| ramp/interleaved | 1.14x | 1.77x | 1.6x | 0.52x | 0.41x | 1.3x |
+| classstep/interleaved | 9.38x | 22.82x | 2.4x | 0.74x | 0.74x | **1.0x** |
+| | | | **median 2.4x** | | | **median 1.3x** |
+
+**Measured against a real peer, this allocator's standing is roughly
+platform-independent — 1.3x median swing, and 1.00x on `classstep`. Measured
+against the system allocator it swings 2.4x.** The variance was never in this
+allocator. It was in how much the shipped mallocs differ from each other.
+
+That is the whole cross-baseline lesson in one table, and it is why every headline
+number in this project's history — 22.8x on Win32, 9.38x against glibc, 22.82x
+against UCRT — is a statement about the opponent.
 
 `ramp/bulk` is the only row we take from tcmalloc, and section S explains it:
 never returning memory below 1 MB. It is worth 5.10x against glibc, which
@@ -995,14 +1027,23 @@ re-faults at 642 per thousand, and only 1.29x against tcmalloc, which does not.
 
 ### The single most misleading number in the project
 
-`classstep/interleaved` is our best result anywhere: **9.38x against glibc**. Read
-the absolute times and it evaporates — glibc 9.75 ms, **tcmalloc 0.77 ms, ours
-1.04 ms**. We are 35% *slower* than tcmalloc on the workload where we look 9.4x
-faster than glibc. The 9.4x is a statement about glibc handling "every allocation
-in a different size class" badly, not about this allocator handling it well.
+`classstep/interleaved` is our best result anywhere: **9.38x against glibc, and
+22.82x against Windows UCRT**. Read the absolute times and both evaporate:
 
-That is the cross-baseline lesson in one row, and it is the same shape as the
-original 22.8x.
+| | Linux | Windows |
+| --- | --- | --- |
+| system allocator | glibc 9.75 ms | UCRT 26.22 ms |
+| real tcmalloc | **0.77 ms** | **0.94 ms** |
+| this allocator | 1.04 ms | 1.27 ms |
+| **us vs tcmalloc** | **0.74x** | **0.74x** |
+
+We are 26-35% *slower* than tcmalloc on the workload where we look 9.4x and 22.8x
+faster than the system allocators — and our ratio against tcmalloc is **identical
+to two decimal places on both platforms** while the system-allocator ratio moves
+by 2.4x. The big numbers describe glibc and UCRT handling
+one-size-class-per-allocation badly. They say nothing about this allocator.
+
+Same shape as the original 22.8x, on the opposite end of the project.
 
 ### Caveat on our own column
 

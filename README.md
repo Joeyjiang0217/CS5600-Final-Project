@@ -203,19 +203,21 @@ discarded. Headline figures are given as ranges over several independent
 measurements: run-to-run spread on this machine is 20-30%, so single numbers
 carry false precision.
 
-An earlier round of this project measured against the **Windows CRT** allocator
-and reported up to 22.8x. That number is not wrong so much as uninformative: the
-Windows CRT heap serialises on a global lock and is the weakest baseline
-available.
+An earlier round of this project reported up to **22.8x** against the Windows CRT
+allocator. That figure is superseded twice over: it came from a 32-bit build whose
+page map is a different data structure, and re-measured on x64 the same workload
+reads **9.52x**. More to the point, it was never informative — the choice of
+baseline turns out to matter more than the choice of workload (Finding 2).
 
-Measurements here are against three allocators, and **the choice of baseline
-turns out to matter more than the choice of workload** (Finding 2):
+Five allocators across three operating systems:
 
 | baseline | platform | notes |
 | --- | --- | --- |
 | **macOS libmalloc** | Apple M3 Pro, macOS 15 | per-thread magazines; the default figures below |
-| **glibc ptmalloc 2.35** | Ubuntu 22.04, aarch64, 4 cores | per-thread arenas + tcache; the baseline the original write-up discussed and never measured |
-| **gperftools tcmalloc 2.18** | macOS | the architecture this project copies |
+| **glibc ptmalloc 2.35** | Ubuntu 22.04 aarch64, 4 cores | per-thread arenas + tcache; the baseline the original write-up discussed and never measured |
+| **Windows UCRT malloc** | Ryzen 7 7700X, Win 10 x64, MSVC 19.42 | forwards to the process heap |
+| **mimalloc 3.4.5** | Windows x64 | Microsoft's allocator, injected and verified |
+| **gperftools tcmalloc 2.18** | all three OSes, same `--enable-minimal` build | the architecture this project copies — the only real peer here |
 
 ### Finding 1 — the speed is in the fast path, not in avoiding locks
 
@@ -249,31 +251,45 @@ experiments did not have. It is the measurement that changed the conclusion.
 
 ### Finding 2 — which workloads it loses depends on the baseline, not the design
 
-**Against four system allocators, the same code wins and loses different
-workloads — and the differences flip sign:**
+**Against five allocators on three operating systems, the same code wins and
+loses different workloads — and the differences flip sign:**
 
-| workload | Windows CRT | macOS libmalloc | glibc ptmalloc | real tcmalloc |
-| --- | --- | --- | --- | --- |
-| fixed 16 B / bulk | 5.3x | 1.10x | **0.30x** | **0.26x** |
-| ramp / bulk | 22.8x | 4.22x | 5.10x | 1.29x |
-| fixed 16 B / interleaved | — | 2.60x | **0.63x** | **0.38x** |
-| ramp / interleaved | — | **0.71x** | 1.14x | **0.52x** |
-| classstep / interleaved | — | 4.05x | **9.38x** | **0.74x** |
+| workload | Windows UCRT | macOS libmalloc | glibc ptmalloc | mimalloc | real tcmalloc |
+| --- | --- | --- | --- | --- | --- |
+| fixed 16 B / bulk | 1.35x | 1.10x | **0.30x** | **0.24x** | **0.45x** |
+| ramp / bulk | 9.52x | 4.22x | 5.10x | 1.01x | 1.43x |
+| fixed 16 B / interleaved | 2.59x | 2.60x | **0.63x** | **0.57x** | **0.72x** |
+| ramp / interleaved | 1.77x | **0.71x** | 1.14x | **0.49x** | **0.41x** |
+| classstep / interleaved | **22.82x** | 4.05x | **9.38x** | **0.91x** | **0.74x** |
 
-Win/loss by baseline: **everything** against Windows CRT, 4 of 5 against macOS
-libmalloc, 3 of 5 against glibc ptmalloc, **1 of 5 against real tcmalloc**.
+The win count falls monotonically as the baseline improves: **5 of 5** against
+Windows UCRT, 4 of 5 against macOS libmalloc, 3 of 5 against glibc, **1 of 5**
+against mimalloc and against real tcmalloc — and that one is a tie.
 
-The best number in the whole project is the `classstep` row's 9.38x against glibc.
-It is also the emptiest: in absolute terms glibc takes 9.75 ms, **real tcmalloc
-0.77 ms, and this allocator 1.04 ms**. We are 35% slower than tcmalloc on the
-workload where we look 9.4x faster than glibc. That 9.4x describes glibc, not us —
-exactly like the original 22.8x described the Windows CRT heap.
+**The decisive comparison is how much each ratio moves between operating systems.**
+Against the shipped system allocator the same workload swings a median of **2.4x**
+(up to 4.5x) between Linux and Windows. Against the same build of real tcmalloc it
+swings **1.3x**, and on `classstep` it is **0.74x on both platforms, identical**.
 
-`fixed/bulk` goes from a 5.3x win to a 3.2x **loss** purely by changing what it is
-compared against. glibc's tcache and fastbins are excellent at a single small size
-class, which is where a per-class thread list has least to add. Meanwhile
+So the allocator's standing against a real peer is roughly platform-independent.
+The variance was never in this allocator — it was in how far apart the shipped
+mallocs are from each other. Which means every headline number in this project's
+history describes the opponent:
+
+| | system allocator | real tcmalloc | us |
+| --- | --- | --- | --- |
+| `classstep`, Linux | glibc 9.75 ms → **9.38x** | 0.77 ms | 1.04 ms |
+| `classstep`, Windows | UCRT 26.22 ms → **22.82x** | 0.94 ms | 1.27 ms |
+
+We are 26-35% *slower* than tcmalloc on the workload where we look 9.4x and 22.8x
+faster than the system allocators.
+
+`fixed/bulk` goes from a 1.35x win against Windows UCRT to a 4.2x **loss** against
+mimalloc, purely by changing what it is compared against. glibc's tcache and
+fastbins, and mimalloc's free lists, are excellent at a single small size class,
+which is where a per-class thread list has least to add. Meanwhile
 `ramp/interleaved` — the workload the rest of this section dissects — **is not a
-loss against ptmalloc at all**.
+loss against ptmalloc or UCRT at all**.
 
 So "which workload does it lose" has no answer independent of the baseline. What
 follows characterises the macOS libmalloc case, because that is where the loss was
