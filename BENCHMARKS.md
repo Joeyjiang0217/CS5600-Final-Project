@@ -276,6 +276,53 @@ warm-up level tested**, and the gap is still 3.3x at `--warmup 100`. Once warm,
 ~5% of allocations still reach CentralCache, and those calls are what p99 is made
 of. That is structural, not transient.
 
+## I. Why `bulk` wins and `ramp/interleaved` loses — two separate mechanisms
+
+`bulk` and `interleaved` differ in **live set size**: 10 000 objects held at once
+versus 64. Holding total operations and size distribution fixed (`--size random`,
+so request size does not depend on the loop index) and varying only the live set:
+
+| live set | pattern | ours (ms) | malloc (ms) | speedup | page faults /1k ops, ours | malloc |
+| --- | --- | --- | --- | --- | --- | --- |
+| 100 | bulk | 2.57 | 5.40 | 2.10x | 1.4 | 0.2 |
+| 1 000 | bulk | 6.26 | 14.66 | 2.34x | 4.3 | 1.3 |
+| 5 000 | bulk | 7.35 | 33.79 | 4.60x | 3.9 | **51.2** |
+| 10 000 | bulk | 7.19 | 32.46 | 4.52x | 4.1 | **57.3** |
+| 10 000 | interleaved | 1.68 | 5.47 | 3.26x | 1.4 | 0.1 |
+
+**Mechanism A — page faults, which is what `bulk` actually measures.** Between a
+1 000- and a 5 000-object live set, libmalloc's soft page faults jump **39x**
+(1.3 → 51.2 per 1 000 operations) and the speedup jumps with them. libmalloc
+returns freed memory to the OS; a workload that allocates a large set, frees all
+of it, and repeats therefore re-faults that memory every round. This allocator
+never returns anything below 1 MB, so it faults its pages in once and reuses them
+— its fault rate stays flat at ~4 regardless of live set. Note that our peak RSS
+is *higher* (221 MB vs 136 MB) while our fault count is *lower*: that combination
+is the signature of hoarding.
+
+This has nothing to do with the ramp. `random/bulk` wins by the same 4.5x.
+
+**Mechanism B — CentralCache round trips, which is what `ramp` measures.** With a
+64-object live set neither allocator returns anything (both at ~0 faults), so the
+comparison collapses to per-call cost. There, `random/interleaved` still wins
+**3.26x** — the fast path is genuinely cheaper. Only `ramp/interleaved` loses, at
+0.8x, and section E shows why: the ramp forces 86.8 central trips per 1 000
+allocations against random's 18.3.
+
+So the two results are not "best case versus worst case" for one design. They are
+**two independent effects that happen to point in opposite directions**:
+
+| | what drives it | ramp involved? | pattern involved? |
+| --- | --- | --- | --- |
+| `bulk` wins 4.5x | memory-return policy → page faults | no | yes (live set) |
+| `ramp/interleaved` loses 0.8x | size-class locality → central trips | yes | no |
+
+**A caveat on an earlier version of this experiment.** Sweeping the live set with
+`--size ramp` is confounded: request size is `(16+i) % 8192 + 1` where `i` is the
+index *within a round*, so shrinking `ntimes` also shortens the ramp and narrows
+the number of size classes touched. The table above uses `--size random`, whose
+size does not depend on `i`, which is why it is the one to read.
+
 ## Notes on method
 
 - **Wall clock, not summed thread time.** An earlier harness accumulated each

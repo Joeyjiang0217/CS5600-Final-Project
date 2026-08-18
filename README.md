@@ -330,11 +330,53 @@ structural.
 
 One number worth keeping: libmalloc's worst single `free` was **592 µs**. That is
 what returning memory to the OS costs — the same behaviour that makes it use 11x
-less memory in Finding 4. This allocator never returns anything under 1 MB, so it
+less memory in Finding 5. This allocator never returns anything under 1 MB, so it
 never pays that spike. Footprint and tail latency are one trade-off seen from two
 sides.
 
-### Finding 4 — the memory cost is much larger than "some overhead"
+### Finding 4 — the big `bulk` win is a page-fault result, not an allocator one
+
+`ramp/bulk` wins 4.5x and `ramp/interleaved` loses 0.8x, which looks like one
+design meeting its best and worst case. It is not. They are **two unrelated
+effects**, and only one of them involves the ramp at all.
+
+The two patterns differ in **live set**: 10 000 objects held at once versus 64.
+Holding operations and size distribution fixed and varying only the live set,
+while counting soft page faults:
+
+| live set | ours (ms) | malloc (ms) | speedup | faults/1k, ours | malloc |
+| --- | --- | --- | --- | --- | --- |
+| 100 | 2.57 | 5.40 | 2.10x | 1.4 | 0.2 |
+| 1 000 | 6.26 | 14.66 | 2.34x | 4.3 | 1.3 |
+| 5 000 | 7.35 | 33.79 | 4.60x | 3.9 | **51.2** |
+| 10 000 | 7.19 | 32.46 | 4.52x | 4.1 | **57.3** |
+
+libmalloc's page faults jump **39x** between a 1 000- and a 5 000-object live
+set, and the speedup jumps with them. It returns freed memory to the OS, so a
+workload that allocates a large set, frees all of it and repeats has to re-fault
+that memory every round. This allocator never returns anything below 1 MB, so it
+faults its pages in once and keeps them — flat at ~4 per thousand, whatever the
+live set. Our peak RSS is *higher* while our fault count is *lower*, which is
+exactly what hoarding looks like.
+
+**So `bulk` is largely measuring memory-return policy, not allocation speed.** It
+has nothing to do with the ramp: `random/bulk` wins by the same 4.5x. And the
+`ramp/interleaved` loss has nothing to do with the pattern: with a 64-object live
+set neither allocator returns anything, both sit near zero faults, and
+`random/interleaved` still wins **3.26x**. Only the ramp loses, for the
+CentralCache reason in Finding 2.
+
+| result | what actually drives it | ramp? | live set? |
+| --- | --- | --- | --- |
+| `bulk` wins 4.5x | memory-return policy → page faults | no | **yes** |
+| `ramp/interleaved` loses 0.8x | size-class locality → central trips | **yes** | no |
+
+Which means the honest summary of this allocator is narrower than either number
+suggests on its own: **it is faster per call, and it wins big whenever hoarding
+memory is the right trade** — and it pays for that hoarding in footprint
+(Finding 5) and, on the ramp, in tail latency (Finding 3).
+
+### Finding 5 — the memory cost is much larger than "some overhead"
 
 Peak RSS, one allocator per process:
 
@@ -362,7 +404,7 @@ production tcmalloc adds, mapped onto the problems the measurements above found:
 
 | Mechanism | Problem it solves | Here |
 | --- | --- | --- |
-| **Per-CPU caches** (restartable sequences) | Cache count scales with cores, not threads — the main lever on Finding 4 | per-thread |
+| **Per-CPU caches** (restartable sequences) | Cache count scales with cores, not threads — the main lever on Finding 5 | per-thread |
 | **Returning memory to the OS** | Idle free lists and spans stop being resident | only spans >1 MB |
 | **Transfer cache** | Smooths cross-thread frees so neither side keeps hitting the central layer | absent (the 2.50x cross-thread case) |
 | **Adaptive cache sizing / periodic scavenging** | Free lists a workload has stopped using shrink back, instead of `MaxSize()` forcing a flush | `MaxSize()` only grows |
@@ -400,6 +442,7 @@ c++ -std=c++14 -O2 -DNDEBUG -pthread -o bench \
 | `--latency` | per-call latency percentiles instead of throughput |
 | `--lat-stride N` | mean gap between latency samples (default 64) |
 | `--warmup N` | discarded rounds before measuring (default 1) |
+| | page faults are reported alongside peak RSS |
 | `--csv` | machine-readable output |
 
 Worth building with sanitizers before trusting any timing — an allocator that is
@@ -423,7 +466,7 @@ Course project, not a drop-in allocator:
   `malloc_usable_size`.
 - **No alignment guarantees beyond 8 bytes.** No over-aligned type support.
 - **Memory is essentially never returned to the OS** — only spans of 128+ pages.
-  Finding 4 is the consequence.
+  Finding 5 is the consequence.
 - **Slower than the system allocator on one measured workload** — ascending
   sizes with a bounded live set, 0.65-0.82x. Finding 2 quantifies why. On a
   bounded live set with fixed or random sizes it is 2.1-3.9x faster.

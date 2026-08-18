@@ -98,7 +98,21 @@ struct Timing {
     double wallMs = 0;        // end-to-end wall clock
     double threadMs = 0;      // summed across threads (the old metric)
     size_t peakRssKiB = 0;
+    size_t minorFaults = 0;   // soft page faults charged to this run
 };
+
+// Soft page faults so far. A run that keeps handing memory back to the OS has
+// to fault it in again next time; one that hoards pages does not. This is how
+// you tell those two apart instead of guessing.
+static size_t MinorFaults() {
+#if defined(_WIN32)
+    return 0;
+#else
+    struct rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
+    return (size_t)ru.ru_minflt;
+#endif
+}
 
 // ------------------------------------------------------------ latency sampling
 
@@ -177,6 +191,7 @@ static Timing RunOnce(const Config& cfg, AllocFn Alloc, FreeFn Free,
     for (auto& v : shared) v.resize(cfg.ntimes, nullptr);
     std::atomic<size_t> barrier{0};   // generation counter for CrossThread
 
+    size_t faultsBefore = MinorFaults();
     Clock::time_point wallStart = Clock::now();
 
     for (size_t k = 0; k < cfg.nworks; ++k) {
@@ -297,6 +312,7 @@ static Timing RunOnce(const Config& cfg, AllocFn Alloc, FreeFn Free,
     out.wallMs = MillisSince(wallStart);
     out.threadMs = threadMsTotal.load();
     out.peakRssKiB = PeakRssKiB();
+    out.minorFaults = MinorFaults() - faultsBefore;
     return out;
 }
 
@@ -457,6 +473,7 @@ int main(int argc, char** argv) {
 
     std::vector<double> mineWall, mineThread, sysWall, sysThread;
     size_t minePeak = 0, sysPeak = 0;
+    size_t mineFaults = 0, sysFaults = 0;
 
     // Alternate which allocator goes first across repetitions. The original
     // harness always ran ours then malloc's, so any drift over the life of the
@@ -470,11 +487,13 @@ int main(int argc, char** argv) {
                 mineWall.push_back(a.wallMs);
                 mineThread.push_back(a.threadMs);
                 minePeak = std::max(minePeak, a.peakRssKiB);
+                mineFaults += a.minorFaults;
             } else if (!doMine && runSys) {
                 Timing b = RunOnce(cfg, Sys, SysFree);
                 sysWall.push_back(b.wallMs);
                 sysThread.push_back(b.threadMs);
                 sysPeak = std::max(sysPeak, b.peakRssKiB);
+                sysFaults += b.minorFaults;
             }
         }
     }
@@ -493,11 +512,12 @@ int main(int argc, char** argv) {
 
     if (csv) {
         printf("size,pattern,threads,ops,mine_wall_ms,sys_wall_ms,speedup_wall,"
-               "mine_thread_ms,sys_thread_ms,mine_wall_sd,sys_wall_sd,peak_rss_kib_mine,peak_rss_kib_sys\n");
-        printf("%s,%s,%zu,%zu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%zu,%zu\n",
+               "mine_thread_ms,sys_thread_ms,mine_wall_sd,sys_wall_sd,peak_rss_kib_mine,peak_rss_kib_sys,"
+               "faults_mine,faults_sys\n");
+        printf("%s,%s,%zu,%zu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%zu,%zu,%zu,%zu\n",
                SizeModeName(cfg.sizeMode), PatternName(cfg.pattern), cfg.nworks, totalOps,
                mw.median, sw.median, speedupWall, mt.median, st.median,
-               mw.stddev, sw.stddev, minePeak, sysPeak);
+               mw.stddev, sw.stddev, minePeak, sysPeak, mineFaults, sysFaults);
         return 0;
     }
 
@@ -513,6 +533,7 @@ int main(int argc, char** argv) {
     printf("--------------------------------------------------------\n");
     printf("  speedup (wall clock, median): %.2fx\n", speedupWall);
     printf("  peak RSS: ours %zu KiB, malloc %zu KiB\n", minePeak, sysPeak);
+    printf("  page faults (total over reps): ours %zu, malloc %zu\n", mineFaults, sysFaults);
     printf("========================================================\n");
     return 0;
 }
