@@ -518,6 +518,145 @@ caching as such; it is **size-class spread with no reclamation**.
 
 ---
 
+## Head to head against libmalloc
+
+The findings above are organised by mechanism. This section is the same data cut
+the other way — one allocator against one allocator, with the reason for each row.
+
+**A note on the tcmalloc column.** Everything for this allocator and libmalloc is
+the same machine (Apple M3 Pro, macOS 15, 4 threads, medians). Real tcmalloc is
+shown for scale, but its *macOS* numbers are depressed by the malloc-zone
+dispatch layer it goes through there — same source and version reads 3.60 ms on
+macOS against **1.60 ms on Linux** for `ramp/interleaved` (Finding 3). Where
+tcmalloc matters below, the Linux figure is the honest one and is labelled as such.
+
+### Throughput
+
+`speedup > 1` means this allocator is faster than libmalloc.
+
+| workload | ours | libmalloc | speedup | n |
+| --- | --- | --- | --- | --- |
+| `classstep/interleaved` | 1.04 ms | ~4.6 ms | **~4.05x** | single runs |
+| `ramp/bulk` | 6.17 ms | 29.83 ms | **4.22x** | 5 (4.05–4.51) |
+| `random/interleaved` | 1.85 ms | 6.11 ms | **3.75x** | 5 (3.23–3.89) |
+| `fixed/interleaved` | 1.24 ms | 2.78 ms | **2.60x** | 5 (2.06–2.71) |
+| `cross` (thread N frees N+1's) | 6.68 ms | 16.73 ms | 2.50x | single |
+| `large` >256 KB | 1.54 ms | 2.19 ms | 1.42x | single |
+| `fixed/bulk` | 6.83 ms | 7.50 ms | 1.10x | single |
+| **`ramp/interleaved`** | 3.41 ms | 2.60 ms | **0.71x** | 11 (0.50–0.82) |
+
+### Why we win, row by row
+
+Each win has a different cause, and only one of them is about being a better
+allocator:
+
+- **`fixed/interleaved`, 2.60x — the fast path is genuinely cheaper.** 99.96% of
+  allocations are served by popping a thread-private list: three instructions, no
+  lock, **no atomic**. libmalloc's magazines are per-*CPU*, so a migrating thread
+  can race them and its fast path needs an atomic compare-exchange, which costs
+  far more than a plain store on arm64. It also carries the full `malloc`
+  contract we do not. Worth about **2x per call**, and verified *not* to be an
+  artefact of our being inlinable while `malloc` is a cross-library call —
+  forcing `noinline` changes it by 1.5%, inside the noise.
+- **`ramp/bulk`, 4.22x — page faults, not allocation speed.** libmalloc returns
+  freed memory to the OS; a workload that allocates 10 000 objects, frees them
+  all, and repeats has to fault that memory back in every round. Measured:
+  **40.4 soft faults per 1 000 operations against our 1.4.** We never return
+  anything under 1 MB, so our pages are faulted once and reused. This row is a
+  memory-*policy* result — it says nothing about the allocator being faster.
+- **`random/interleaved` 3.75x and `classstep` ~4x — local recycling works.** With
+  a 64-object live set spread over ~130 size classes, an object freed into a class
+  is handed back out by that class's next allocation before the list overflows, so
+  it never leaves the thread: **18.6 and 2.6 CentralCache trips per 1 000
+  allocations** respectively. Nearly everything is fast path.
+- **`fixed/bulk` 1.10x and `large` 1.42x are close to ties**, single measurements,
+  and should not be leaned on.
+
+### Why we lose `ramp/interleaved` — 0.71x
+
+The one loss, and it takes two facts to explain, one on each side.
+
+**Our side.** An ascending size sweep with a bounded live set puts each size class
+into a "drain then fill" cycle: for `W` iterations it only serves allocations
+(list runs dry → fetch from CentralCache), then for `W` iterations it only
+receives frees while allocation has moved on (list exceeds `MaxSize()` → flush
+back). The pile that accumulates is ~64 objects against a `MaxSize()` of ~19, so it
+cannot be held locally. Result: **86.8 central trips per 1 000 allocations against
+18.6 for random sizes**, at ~70 ns each versus ~2 ns for a local pop.
+
+**libmalloc's side.** Measured directly with `malloc_size()`: from 1 KB to 8 KB —
+87% of this workload's range — **libmalloc quantises to 512 bytes and we quantise
+to 128**. Its buckets are 4x coarser, so the ramp lingers 4x longer in each one and
+the same drain/fill penalty is spread over 4x more allocations. Same mechanism,
+milder for it.
+
+This also explains why libmalloc is *faster on the ramp than on random sizes*
+(2.60 ms against 6.11 ms): coarse buckets only help when sizes advance in order.
+
+### The memory problem, and its three causes
+
+This is the allocator's most serious defect, and it is not subtle:
+
+| workload | ours | libmalloc | ratio |
+| --- | --- | --- | --- |
+| `fixed/interleaved` | 2.6 MB | 2.8 MB | 0.9x |
+| `ramp/bulk` | 221 MB | 136 MB | 1.6x |
+| `random/interleaved` | 54 MB | 9 MB | 6.3x |
+| `classstep/interleaved` | 90 MB | 7 MB | 13.3x |
+| **`ramp/interleaved`** | **137 MB** | **7 MB** | **18.9x** |
+
+For scale, the application's live data in that last row is **0.87 MB**. libmalloc
+holds 8x it; we hold **157x** it. Real tcmalloc, on Linux, holds 22 MB for the
+equivalent work — a fifth of ours — *while being faster*.
+
+**It is not size-class rounding.** That is the natural suspect and it is wrong:
+measured rounding waste on this workload is **1.5%, about 0.04 MB**. The problem is
+the other 136 MB, and it has three causes, none of which is fragmentation inside a
+block:
+
+1. **Free lists only ever grow.** `MaxSize()` increases by one per refill and there
+   is no code path anywhere that decreases it. A size class the workload touched
+   once during a burst keeps its capacity for the life of the process.
+2. **One live object pins a whole span.** A span returns to `PageCache` only when
+   `_useCount` hits zero. With ~130 size classes active, each holding a 31–32 page
+   (≈250 KB) span with a couple of objects still out, the pinned total is tens of
+   megabytes that nothing can reclaim.
+3. **`PageCache` almost never returns memory to the OS.** `SystemFree` is reached
+   only for spans of 128+ pages (1 MB). For a workload whose objects are all ≤8 KB,
+   **nothing is ever given back** — the peak becomes a high-water mark for the
+   life of the process.
+
+Note that 1 and 3 are exactly what wins `ramp/bulk` its 4.22x. **It is one policy
+with two faces**: hoarding pays when the live set cycles and the OS would
+otherwise re-fault, and costs 19x when it does not. The fix is not to stop
+hoarding but to add a scavenger — which is what real tcmalloc has, and why it
+holds 22 MB instead of 137 MB at higher speed. An attempt to raise the cache
+capacity *without* adding reclamation made both axes worse (BENCHMARKS.md
+section O), which is the same lesson from the other direction.
+
+### Choosing between them
+
+| use this allocator when | use libmalloc when |
+| --- | --- |
+| the process is long-running, so the ~3x cold-start penalty amortises (`--warmup 0` measures **0.32x**) | the process is short-lived — a CLI tool or test runner never gets past the cold-start cost |
+| memory is plentiful — you can absorb up to 19x resident | memory is constrained; 19x is disqualifying on its own |
+| the live set is large and cyclic: allocate a batch, free it all, repeat | the live set is bounded and sizes advance in order — the one shape we lose |
+| the hot loop is allocation-dominated | there is real work between allocations, where a ~1 ns per-call edge disappears |
+| you can call `ConcurrentAlloc`/`ConcurrentFree` explicitly | you need the actual `malloc` contract — `malloc(0)`, 16-byte alignment, `realloc`, `calloc`, `malloc_size`, `operator new` |
+| | you have a tail-latency budget and the workload spreads across size classes: our p99.9 is **9 842 ns against 610 ns** |
+
+**And the honest bottom line: in production you would pick neither.** The per-call
+advantage is ~2x on an operation costing ~2 ns — about **1 nanosecond**, which
+disappears behind any real work between allocations. Meanwhile real tcmalloc beats
+both of these on Linux (1.60 ms against libmalloc-equivalent 7.50 ms and our
+4.33 ms), and mimalloc wins 4 of 5 workloads against us on Windows — and both are
+genuine drop-in replacements. The value of this comparison is not a deployment
+decision; it is that the cost of the "per-thread cache, never give memory back"
+trade is now quantified on both sides: **~1 ns and one page fault saved per call,
+against 19x memory, 16x tail latency, and 3x cold start.**
+
+---
+
 ## Where real tcmalloc goes further
 
 The core ideas here are the real ones — thread-local free lists, slow-start
