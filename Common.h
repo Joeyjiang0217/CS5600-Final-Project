@@ -30,6 +30,13 @@ static const size_t NPAGES = 129;
 static const size_t PAGE_SHIFT = 13; // 8KB
 
 #ifdef _WIN32
+    // <windows.h> defines min and max as macros unless NOMINMAX is set, which
+    // breaks every std::max call that follows it -- under MSVC the peak-RSS
+    // tracking in main.cpp fails to compile without this. MinGW's headers do
+    // not hit it, so a GCC-only build will not catch the omission.
+    #ifndef NOMINMAX
+        #define NOMINMAX
+    #endif
     #include <windows.h>
 #else
     #include <sys/mman.h>

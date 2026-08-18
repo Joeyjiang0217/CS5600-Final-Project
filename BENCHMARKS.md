@@ -1014,6 +1014,223 @@ that `ConcurrentAlloc` goes to `mmap` and should not depend on which malloc the
 process installed. That assumption is not verified, so ratios involving our column
 are approximate; the opponent-versus-opponent numbers are not affected.
 
+## U. Windows x64 — three baselines, and the trap that makes two of them fake
+
+AMD Ryzen 7 7700X (8 physical cores, 16 logical), 31.2 GB,
+Windows 10 Pro 19045.6466 x64, MSVC 19.42.34436 (VS 2022 17.12, toolset
+14.42.34433), Windows SDK 10.0.22621.0, `/std:c++14 /O2 /DNDEBUG /EHsc` with
+`psapi.lib`. Raw per-process rows in [`results/windows-x64/`](results/windows-x64/).
+
+Three baselines in one batch: **Windows UCRT malloc**, **mimalloc 3.4.5**, and
+**gperftools 2.18.1 `tcmalloc_minimal`** — the same version and the same
+`--enable-minimal` configuration used for macOS in section Q and Linux in
+section S, so the tcmalloc column is comparable across all three operating
+systems.
+
+Everything here is x64. A Win32 build selects `TCMalloc_PageMap1<32 - PAGE_SHIFT>`,
+a flat array covering the low 4 GB, instead of `TCMalloc_PageMapRadix64<48 - PAGE_SHIFT>`;
+those are different data structures and their numbers do not belong in the same
+table. Checked per binary rather than assumed: PE machine `0x8664`, and `_WIN64`
+defined, which is what `PageCache.h` switches on.
+
+### The correctness gate, and why ASan alone would not have been one
+
+The 12 `size` x `pattern` combinations run clean under `/fsanitize=address`. That
+is worth less than it looks. ASan interposes on `malloc`/`free`, and there is not
+one `ASAN_POISON_MEMORY_REGION` anywhere in this project, so the sanitizer cannot
+see inside `ConcurrentAlloc`'s free lists at all — it validates the *baseline*
+side of the comparison and generic stack and global errors, and very little of
+the allocator under test.
+
+`verify.cpp` checks the allocator's own contract instead: never null, aligned to
+at least `sizeof(void*)`, the whole requested extent writable, and — the one that
+matters — **no two simultaneously live blocks share a byte**. Every block is
+stamped with a tag unique to (thread, allocation) and re-verified immediately
+before it is freed, so handing the same memory out twice, handing out a block
+that overlaps a live one, and returning a block shorter than requested all
+surface as a corrupted stamp. The stamp check is lock-free, so the concurrency
+profile stays close to the benchmark's; `--registry` adds exact duplicate-pointer
+detection behind a global lock as a second pass.
+
+All clean: 12/12 under ASan, 12/12 under the invariant checker, 12/12 with
+`--registry`, and 12/12 at 8 threads across three seeds.
+
+A gate that cannot fail is not a gate, so both directions were checked.
+`--alloc broken` (an allocator that deliberately hands the same slab out
+repeatedly) is caught 59 030 times; `--alloc sys` reports zero, so the checker
+does not simply fire on everything.
+
+### A trap: `/MT` silently defeats both overrides
+
+`cl` links the CRT statically by default. mimalloc's redirector patches the
+malloc exports of `ucrtbase.dll`, and gperftools patches the CRT's malloc in
+loaded modules — with a static CRT there is no module export to patch, and the
+program's own `malloc` calls go straight to the CRT code linked into the
+executable. Both injections still initialise and report success. mimalloc prints
+`mimalloc: malloc is redirected.` while not having redirected this binary's
+malloc at all.
+
+The tell was that the first mimalloc batch landed on top of UCRT: 49.6 ms against
+52.9 ms on `ramp/bulk`, 25.5 against 26.9 on `classstep/interleaved`. Two
+allocators do not agree to that precision. Checked per pointer:
+
+| CRT linkage | mimalloc: `mi_is_in_heap_region(malloc(n))` | tcmalloc: 80 MB via `malloc` moves `generic.current_allocated_bytes` by |
+| --- | --- | --- |
+| `/MT` (cl default) | no | **0.0 MB** |
+| `/MD` | **yes** | **80.0 MB** |
+
+This is a third distinct failure mode. macOS linked tcmalloc and it silently
+*did* take over `malloc` (section Q); Ubuntu's `--as-needed` silently dropped the
+library (section S); Windows links it, loads it, initialises it, prints that it
+worked, and still routes every allocation to the CRT. All three are invisible
+without a positive per-pointer check.
+
+Section T left the mirror-image assumption unverified — that under injection our
+own column still measures `ConcurrentAlloc`. On Windows it can be measured
+directly, and it holds: during `--only mine` the injected allocator accounts for
+3.5 MB (tcmalloc) and 7.1 MB (mimalloc) against a ~200 MB process working set,
+while during `--only sys` it accounts for essentially all of it. `ConcurrentAlloc`
+calls `VirtualAlloc` and is not intercepted.
+
+A `/MD` UCRT control was built for the same reason, and CRT linkage does not move
+the UCRT numbers (`ramp/bulk` 47.9 ms against 52.9, `classstep` 26.2 against
+26.9), which is what lets the canonical `/MT` UCRT column sit in the same table
+as the two `/MD` injected ones.
+
+### Opponent absolute times — the cleanest comparison
+
+Same harness, same machine, only the allocator swapped. Medians of five
+independent processes, 4 threads.
+
+| workload | UCRT malloc | mimalloc | real tcmalloc | tcmalloc vs UCRT |
+| --- | --- | --- | --- | --- |
+| fixed/bulk | 4.31 ms | **0.74 ms** | 1.42 ms | 3.0x |
+| ramp/bulk | 47.90 ms | **5.30 ms** | 6.70 ms | 7.1x |
+| fixed/interleaved | 2.89 ms | **0.62 ms** | 0.81 ms | 3.6x |
+| ramp/interleaved | 7.22 ms | 2.06 ms | **1.51 ms** | 4.8x |
+| classstep/interleaved | 26.22 ms | 1.07 ms | **0.94 ms** | **27.9x** |
+
+Both modern allocators beat the Windows CRT on all five, and mimalloc takes three
+of the five rows from tcmalloc.
+
+### Us, against three Windows baselines
+
+Ratio is opponent over ours, so **> 1 means we are faster**. Ranges are the five
+independent runs, not a standard deviation.
+
+| workload | ours (ms) | UCRT malloc | mimalloc | real tcmalloc |
+| --- | --- | --- | --- | --- |
+| fixed/bulk | 3.11 (2.97-3.17) | 1.35x (1.25-1.37) | 0.24x (0.22-0.25) | 0.45x (0.44-0.48) |
+| ramp/bulk | 5.35 (5.32-5.71) | **9.52x** (9.27-10.51) | 1.01x (0.98-1.12) | **1.43x** (1.25-1.47) |
+| fixed/interleaved | 1.11 (1.11-1.14) | 2.59x (2.56-2.60) | 0.57x (0.56-0.58) | 0.72x (0.70-0.76) |
+| ramp/interleaved | 4.30 (3.84-4.40) | 1.77x (1.71-2.01) | 0.49x (0.47-0.50) | 0.41x (0.41-0.43) |
+| classstep/interleaved | 1.17 (1.15-1.23) | **22.82x** (21.33-23.66) | 0.91x (0.90-0.95) | 0.74x (0.71-0.75) |
+
+**Against real tcmalloc we win one of five** — the same score as Linux in section
+T, on the same row, for the same reason: `ramp/bulk` is where never returning
+memory below 1 MB pays, and tcmalloc scavenges.
+
+### `classstep/interleaved` gives the same 0.74x on two operating systems
+
+Section T called this the most misleading number in the project. Windows makes
+the point harder, because the same row can now be read against two very different
+baselines on one machine:
+
+| | ours | system allocator | real tcmalloc | looks like | actually |
+| --- | --- | --- | --- | --- | --- |
+| Linux (section T) | 1.04 ms | glibc 9.75 ms | 0.77 ms | 9.38x | **0.74x** |
+| Windows | 1.29 ms | UCRT 26.22 ms | 0.94 ms | **22.32x** | **0.74x** |
+
+The headline multiplier more than doubles, from 9.4x to 22.3x, and the honest
+number does not move at all. Two operating systems, two system allocators, the
+same pair of thread-caching designs, **0.74x both times**. What changed between
+the two rows is entirely the baseline's handling of "every allocation in a
+different size class".
+
+That also puts the original 22.8x in its place. This project's first Windows
+number was `ramp/bulk` = 22.8x measured on a Win32 build; on x64 that same
+workload measures **9.52x**. The 22.8x-shaped result on this machine is a
+different workload against a baseline that happens to be bad at it.
+
+### `ramp/interleaved` across every baseline measured
+
+The one row this allocator loses everywhere except Windows CRT:
+
+| baseline | ratio |
+| --- | --- |
+| Windows UCRT malloc | **1.77x** |
+| glibc ptmalloc | 1.14x |
+| macOS libmalloc | 0.71x |
+| real tcmalloc (Linux) | 0.52x |
+| Windows mimalloc | 0.49x |
+| real tcmalloc (Windows) | **0.41x** |
+
+A 4.3x spread across baselines for one fixed workload on fixed hardware, against
+a 1.35x-to-22.8x spread across workloads for one fixed baseline. Same tcmalloc
+build reads 0.52x on Linux and 0.41x on Windows, which is close enough that the
+remaining gap is more plausibly OS paging behaviour than anything in the
+allocator.
+
+### Peak RSS and page faults
+
+One allocator per process — `GetProcessMemoryInfo` reports a process-wide
+monotonic high-water mark, so a shared process cannot measure this. Faults per
+1000 operations.
+
+| workload | metric | ours | UCRT | mimalloc | real tcmalloc |
+| --- | --- | --- | --- | --- | --- |
+| ramp/bulk | peak | 328.5 MB | 135.9 MB | 161.3 MB | 156.8 MB |
+| | faults /1k | 12.27 | **150.88** | 4.06 | **3.30** |
+| ramp/interleaved | peak | 246.0 MB | 25.1 MB | **12.5 MB** | 25.1 MB |
+| | faults /1k | 11.69 | 7.39 | **0.27** | 0.78 |
+| classstep/interleaved | peak | 85.7 MB | 11.1 MB | **7.3 MB** | 10.8 MB |
+| | faults /1k | **0.09** | 10.10 | 0.13 | 0.13 |
+
+UCRT's 150.88 faults per thousand on `ramp/bulk` is the same mechanism as glibc's
+642 in section S — memory handed back to the OS and faulted in again — and it is
+most of where our 9.52x on that row comes from. We fault 12x less and still hold
+2.4x the memory.
+
+`ramp/interleaved` remains the one workload where we fault *more* than the
+baseline while also holding 9.8x the memory, which is the section E story
+unchanged by the platform.
+
+How badly a shared process corrupts this, measured rather than asserted:
+
+| workload | allocator | peak, shared process | peak, own process | inflation |
+| --- | --- | --- | --- | --- |
+| ramp/interleaved | UCRT | 270.8 MB | 25.1 MB | **10.8x** |
+| classstep/interleaved | UCRT | 96.9 MB | 11.1 MB | **8.8x** |
+| ramp/bulk | UCRT | 462.5 MB | 135.9 MB | 3.4x |
+
+### Caveats
+
+- **Our column drifts slightly with the opponent binary.** The harness's own
+  `std::vector` allocations route through whichever allocator is installed. Across
+  the three `/MD` binaries our medians are 5.14 / 5.13 / 4.69 ms on `ramp/bulk`,
+  4.18 / 4.24 / 3.68 on `ramp/interleaved`, and 1.16 / 1.18 / 1.29 on
+  `classstep/interleaved` — up to 12% either way, and not always in the same
+  direction. Far smaller than the 49% section T saw under `LD_PRELOAD`, but
+  ratios involving our column carry that much slack. Opponent-versus-opponent
+  numbers do not.
+- `fixed/bulk` in the tcmalloc binary has the widest single-column spread
+  anywhere in this section, 19.2% across five runs (2.95-3.56 ms). Treat that row
+  as the least resolved.
+- `ramp/interleaved` has the widest ratio spread against UCRT, 16.9%.
+- Windows `PageFaultCount` counts soft and hard faults together, unlike Linux
+  `ru_minflt`. The Windows fault columns are not strictly the same quantity as
+  the Linux ones in sections R and S.
+- **Unverified mechanism.** The Windows NT heap activates its Low Fragmentation
+  Heap per size bucket only after enough allocations of that size. That would
+  explain the shape of the UCRT column — `fixed` (one size, LFH fully active)
+  loses by only 1.35x, `ramp` partially defeats activation, and `classstep`
+  (every allocation in a different class, dwell = 1) never activates it at all
+  and loses by 22.8x. Consistent with all five rows, but LFH activation state was
+  not measured, so this is a hypothesis and not a finding.
+- gperftools supports only `tcmalloc_minimal` on Windows. The Linux and macOS
+  measurements also used the minimal build, so the configuration matches; the
+  allocation fast path is the same as full tcmalloc.
+
 ## Notes on method
 
 - **Wall clock, not summed thread time.** An earlier harness accumulated each
