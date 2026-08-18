@@ -13,6 +13,11 @@ Reproduce any row with the command shown; every knob is a flag.
 ./build/bench --threads 4 --rounds 10 --ntimes 10000 --reps 15 --size ramp --pattern bulk
 ```
 
+> **Read section X before quoting any macOS libmalloc figure from sections A–W.**
+> Those were measured with `MallocNanoZone=0` in the environment, which disables
+> libmalloc's small-allocation front-end. Section X re-measures the whole macOS
+> column with the variable removed, corrects three rows, and refutes one outright.
+
 ## A. Thread-count sweep — `--size ramp --pattern bulk`
 
 | threads | ours (ms) | malloc (ms) | speedup |
@@ -1550,6 +1555,16 @@ margin in the project.
 README was measured at 128 bytes, and flipping the default would silently
 invalidate all of them. The knob makes the result reproducible without that.
 
+### Environment note
+
+Every figure in this section was measured with `MallocNanoZone=0` in the
+environment, which disables libmalloc's small-allocation front-end. Section X
+re-measures the macOS column without it. The A/B here is unaffected — the knob does
+not touch `malloc`, and `ramp` workloads barely use the nano front-end — but the
+libmalloc-relative figures shift slightly: `ramp/interleaved` reads
+**0.80x → 1.26x** rather than 0.79x → 1.25x, and peak RSS **22.5x → 9.7x** rather
+than 24.5x → 10.5x. The p99.9 pair reads 2 631 → 528 ns.
+
 ### Two documented figures that did not reproduce
 
 Found while establishing the baseline for this section, and not caused by it —
@@ -1568,6 +1583,265 @@ both reproduce as *single samples* but not as medians:
 - **Section G's `ramp/interleaved` p99.9 of 9 842 ns.** The median of five runs is
   2 169 ns. The direction of that finding holds; the magnitude was a tail sample.
 
+## X. Re-measuring the macOS baseline — a fourth silent failure, and a refuted row
+
+Sections A–W measure libmalloc through an environment that had
+`MallocNanoZone=0` set. That disables libmalloc's nano front-end for small
+allocations, and it is not the macOS default. This section re-measures the whole
+macOS column with the variable removed, and in the process refutes one documented
+row outright.
+
+### The trap
+
+`MallocNanoZone=0` was set by the process running the shell, not by any shell
+profile — `env -u MallocNanoZone /bin/zsh -lic 'echo [$MallocNanoZone]'` prints
+empty, so an interactive login shell never sees it. Its effect on the baseline,
+`fixed/interleaved`, `--only sys`, medians of five:
+
+| | libmalloc |
+| --- | --- |
+| variable removed (the real macOS default) | **1.54 ms** |
+| `MallocNanoZone=1` | 1.41 ms |
+| `MallocNanoZone=0` | **2.00 ms** |
+
+This joins the three platform traps in the notes below as a fourth, and it is the
+nastiest kind: not in the code, not in a shell profile, but in the tooling
+environment. **Record the value of `MallocNanoZone` alongside any macOS malloc
+measurement.**
+
+### Why it hits some workloads and not others
+
+Enumerating the registered zones with `malloc_get_all_zones`, and asking every
+zone's `size()` callback which one owns a pointer:
+
+| | zones registered | 16 B | 200 B | 300 B and up |
+| --- | --- | --- | --- | --- |
+| nano on | 2 — `DefaultMallocZone` (nano), `MallocHelperZone` (scalable) | nano only | nano only | both — nano forwards |
+| nano off | 1 — `DefaultMallocZone` (scalable) | scalable | scalable | scalable |
+
+**The nano front-end only serves allocations up to roughly 256 bytes.** So the
+variable moves `fixed` (16 B) substantially and leaves `ramp`, `random` and
+`classstep` — which span 1 B to 8 KB — essentially untouched.
+
+### The corrected macOS column
+
+4 threads, medians of **15 independent processes** per cell, our own time is the
+pooled median of both environments (this allocator does not call `malloc`, so it is
+unaffected):
+
+| workload | ours | libmalloc nano ON | **speedup ON** | libmalloc nano OFF | speedup OFF | documented |
+| --- | --- | --- | --- | --- | --- | --- |
+| `ramp/bulk` | 5.21 ms | 23.47 | **4.51x** | 22.83 | 4.49x | 4.22x |
+| `classstep/interleaved` | 1.14 | 4.38 | **3.80x** | 4.48 | 4.02x | ~4.05x |
+| `random/interleaved` | 1.83 | 5.79 | **3.21x** | 5.76 | 3.15x | 3.75x |
+| `ramp/cross` | 6.81 | 17.33 | **2.54x** | 17.43 | 2.46x | 2.50x |
+| `fixed/interleaved` | 0.89 | 1.30 | **1.47x** | 1.85 | 2.08x | **2.60x** |
+| `ramp/interleaved` | 3.53 | 2.79 | **0.83x** | 2.86 | 0.80x | 0.71x |
+| `fixed/bulk` | 5.49 | 1.93 | **0.35x** | 3.97 | 0.72x | **1.10x** |
+| `large/bulk` | 259 | 72 | **0.28x** | 73 | 0.28x | **1.42x** |
+| `large/interleaved` | 161 | 7.56 | **0.047x** | 7.69 | 0.043x | not measured |
+
+**The macOS scoreboard goes from 7 wins and 1 loss to 5 wins and 4 losses.** Three
+rows changed for two different reasons.
+
+The `fixed` rows changed because of the environment: `fixed/interleaved` was
+inflated 1.4x and `fixed/bulk` 2.1x. `fixed/bulk` was recorded as a 1.10x win and
+is a **2.9x loss**, which strengthens rather than weakens the existing conclusion
+that a single small size class is not this design's ground.
+
+The `large` row changed for a different reason entirely.
+
+### The `large` row does not reproduce, and the harness is not the reason
+
+Section C records `large >256 KB | bulk | 1.54 | 2.19 | 1.42x`. Measured today with
+the same stated command: **259 ms and 72 ms, 0.28x** — a factor of ~170 on our side.
+Ruled out one at a time:
+
+- **Not the environment.** 259 ms with nano on, 263 ms with it off.
+- **Not the size generator.** `git show` confirms `SizeMode::Large` is
+  byte-identical to its definition at that commit:
+  `256 * 1024 + (rng() % (64 * 1024)) + 1`.
+- **Not the harness.** This is the decisive control: check out `bbce645` — the
+  commit that recorded the row — build **its own** `main.cpp`, and run its own
+  command. It gives **297 / 307 / 294 ms** for us and 69 / 71 / 76 ms for libmalloc.
+
+```bash
+git archive bbce645 | tar -x -C /tmp/old && cd /tmp/old
+c++ -std=c++14 -O2 -DNDEBUG -pthread -o benchold \
+    main.cpp CentralCache.cpp PageCache.cpp ThreadCache.cpp
+env -u MallocNanoZone ./benchold --size large --pattern bulk --threads 4
+```
+
+So the harness at that commit disagrees with the number recorded at that commit.
+Section C notes those rows were single runs; this one was simply wrong. **`large`
+was never a 1.42x win.**
+
+### What `large` actually is: the only lock-contention result in the project
+
+`ConcurrentAlloc` sends anything above `MAX_BYTES` straight to `PageCache`'s single
+global mutex, and `ConcurrentFree` returns it the same way. There is no thread
+cache on that path at all. `large/interleaved`, nano on, medians of five:
+
+| threads | ours | libmalloc | speedup |
+| --- | --- | --- | --- |
+| 1 | 10.64 ms | 5.56 | 0.52x |
+| 2 | 38.58 | 6.05 | **0.15x** |
+| 4 | 162.28 | 7.67 | **0.04x** |
+| 8 | 507.96 | 14.04 | **0.02x** |
+
+Our time roughly **quadruples per doubling of threads** (3.6x, 4.2x, 3.1x) while
+libmalloc stays nearly flat. That is lock-convoy collapse, not slow allocation
+logic — and the same size distribution is a **2.34x win at one thread**
+(`large/bulk`, 13.46 ms against 31.54 ms).
+
+This is the one place in the project where locking determines the outcome, and it is
+the one place the design has no cache. Everywhere a thread cache exists, the
+advantage is largest at one thread and *decays* with concurrency (see the per-call
+table below).
+
+### Memory and tail latency, re-measured
+
+Peak RSS, one allocator per process, medians of five. The 512 B column is the
+section W knob:
+
+| workload | ours 128 B | ours 512 B | libmalloc | 128/lib | 512/lib |
+| --- | --- | --- | --- | --- | --- |
+| `fixed/interleaved` | 3.0 MB | 3.1 | 2.9 | 1.0x | 1.1x |
+| `fixed/bulk` | 3.8 | 3.8 | 3.6 | 1.0x | 1.0x |
+| **`ramp/interleaved`** | **185.6** | **80.1** | **8.3** | **22.5x** | **9.7x** |
+| `ramp/bulk` | 252.0 | 201.2 | 122.6 | 2.1x | 1.6x |
+| `random/interleaved` | 71.9 | 45.6 | 11.0 | 6.5x | 4.1x |
+| `classstep/interleaved` | 91.4 | 59.6 | 7.9 | 11.6x | 7.6x |
+| `ramp/cross` | 293.1 | 216.8 | 49.8 | 5.9x | 4.3x |
+
+Enabling nano raises libmalloc's own RSS slightly (7.5 → 8.3 MB on
+`ramp/interleaved`), so our ratio improves marginally, from section W's 24.5x to
+**22.5x**. Direction unchanged.
+
+`ramp/interleaved` alloc latency, nano on, medians of 15 with full ranges:
+
+| | p99 | p99.9 |
+| --- | --- | --- |
+| ours 128 B | 361 [320–1 110] | **2 631 [1 423–10 770]** |
+| ours 512 B | 277 [236–279] | **528 [445–1 734]** |
+| libmalloc | 70 [27–182] | **235 [153–1 822]** |
+
+Section G recorded 9 842 ns against 610 ns, "16x worse", from single samples. The
+median p99.9 ratio is **11.2x** and the top of our observed range is 10 770 ns — so
+that figure was a draw from the top of a fat-tailed distribution, and **the ratio it
+reported was about right even though neither absolute value was typical**. The
+512 B build cuts our tail 5.0x, to 2.2x libmalloc's.
+
+### The per-call gap: 1.85x, and only a third of it explained
+
+One thread, 16-byte allocations, interleaved window 64, nano on, medians of 7
+processes:
+
+| | ns per call |
+| --- | --- |
+| ours, inlined (how the harness calls it) | 1.61 [1.55–1.90] |
+| ours, forced to a real non-inlined call | **2.67 [2.66–3.02]** |
+| libmalloc | **4.94 [4.90–5.01]** |
+
+The fair comparison is the middle row against the last: **1.85x, a gap of 2.27 ns.**
+Note that **1.06 ns of our raw 3.07x is inlinability alone** — a property of how the
+harness calls us, not of the allocator. Section J's "not inlining, only 1.5%" is a
+fraction of whole-run time, where the loop dominates; as a fraction of per-call
+allocator cost it is about 40%, and a per-call claim has to use the latter.
+
+**The advantage decays with concurrency**, which is what section 1's finding
+predicts of a fast-path effect and the opposite of a contention story:
+
+| threads | 1 | 2 | 4 | 8 |
+| --- | --- | --- | --- | --- |
+| ours (inlined) | 1.68 | 1.95 | 2.52 | 4.84 |
+| libmalloc | 5.10 | 5.10 | 5.70 | 8.80 |
+| ratio | **3.04x** | 2.62x | 2.26x | **1.82x** |
+
+libmalloc is nearly flat from 1 to 4 threads, so its cost is not contention either.
+
+**Candidates ruled out**, each by adding the thing to *our* fast path and
+re-measuring:
+
+| candidate | cost per call | verdict |
+| --- | --- | --- |
+| one atomic RMW (`fetch_add`, acq_rel) | **−0.07 ns** | free — hidden in the pipeline |
+| one uncontended `std::mutex` lock+unlock | **+4.64 ns** | larger than the whole gap; libmalloc cannot be paying it |
+| `malloc(0)` returns a valid pointer | −0.25 ns | below the noise floor |
+| `free(NULL)` is a no-op | −0.10 ns | below the noise floor |
+| free-list integrity stamp + verify | −0.05 ns | below the noise floor |
+| a per-call thread-identity read | +0.64 ns each | **we pay this too** — see below |
+| zone dispatch (for libmalloc) | < 1 ns, unresolvable | it *is* the default zone |
+
+The disassembly explains the last one. `static thread_local ThreadCache*
+pTLSThreadCache` compiles on macOS/arm64 to an **indirect call through the TLV
+thunk** — `ldr x8, [x0]; blr x8` — on every allocation *and* every free. So the
+thread-identity cost is not a differentiator; both sides pay it. It also suggests an
+optimisation never tried here: roughly 1.3 ns of our 2.55 ns may be TLS access.
+
+**So the common explanation — that `malloc` is slower because it must be safe and
+satisfy a contract — is not supported on this machine.** Those items priced out at
+or below the noise floor. About **2 ns of the 2.27 ns gap remains unattributed**, and
+closing it would require instrumenting libmalloc itself, which this project has not
+done. The advantage is real and reproducible; its mechanism is a third explained.
+This is the same kind of open remainder as the 1.33x in section V.
+
+### The zone tax, decomposed
+
+Section V measured a ~1.5x cost for reaching tcmalloc through the macOS malloc zone.
+That survives the environment correction: **1.43x with nano on, 1.54x with it off.**
+In absolute terms it is about **5.4 ns per call** — far more than one indirect call,
+so something more than a jump is happening.
+
+Same allocator at both ends, only the entry point varying (1 thread, ramp sizes,
+nano off, medians of 11):
+
+| path | ns per call | added |
+| --- | --- | --- |
+| `tc_malloc` + `tc_free` — no zone at all | 2.59 | — |
+| `malloc` + `tc_free` — zone on alloc only | 3.75 | **+1.16 (27%)** |
+| `tc_malloc` + `free` — zone on free only | 5.36 | **+2.77 (66%)** |
+| `malloc` + `free` — zone on both | 6.80 | +4.20 |
+
+Roughly additive, and **the free side carries about two thirds.** That is the
+mechanism: `free(ptr)`'s contract accepts a pointer from *any* zone, so it must
+first determine ownership, and for a foreign allocator that determination crosses an
+allocator boundary. For libmalloc, which *is* the default zone, the same
+decomposition produced incoherent sub-noise values (negative "costs") — the effect
+there is under 1 ns and this method cannot resolve it.
+
+### A crash found on the way: `ConcurrentAlloc(0)`
+
+`SizeClass::Index(0)` computes `((0 + 7) >> 3) - 1`, which underflows to
+`SIZE_MAX`, and `ThreadCache::Allocate` then indexes `_freeList[SIZE_MAX]`.
+
+| build | behaviour |
+| --- | --- |
+| assertions on | `Assertion failed: (index < NFREELISTS)` in `FetchFromCentralCache` |
+| `-DNDEBUG` (the measured build) | corrupts, then aborts in a mutex — `mutex lock failed: Invalid argument` |
+
+libmalloc returns a valid 16-byte block for `malloc(0)`. This is the same shape as
+the `FetchFromCentralCache` bug in section P: undefined behaviour that assertions
+hide in debug builds and that exists only in the configuration you benchmark.
+Recorded, not yet fixed.
+
+### What this section supersedes
+
+| location | recorded | current, medians of ≥5 |
+| --- | --- | --- |
+| C, `fixed 16 B / interleaved` | 2.78x | **1.47x** |
+| C, `fixed 16 B / bulk` | 1.10x | **0.35x** |
+| C, `large > 256 KB / bulk` | 1.42x | **0.28x** — the recorded figure does not reproduce on its own commit's harness |
+| D, `ramp/interleaved` peak RSS | 131 408 KiB | **185.6 MB**, 22.5x libmalloc |
+| G, `ramp/interleaved` p99.9 | 9 842 ns vs 610 ns | **2 631 vs 235 ns**; the 16x ratio holds, the absolutes were tail draws |
+| J, per-call advantage | ~2x | **1.85x**, with 1.06 ns of it inlinability |
+| Head-to-head, `large` | 1.42x win | **0.28x**, and 0.047x under `interleaved` |
+
+The rows that did **not** move: `ramp/bulk`, `ramp/interleaved`, `random/interleaved`,
+`classstep/interleaved`, `cross`. Every mechanism established on those — the
+page-fault story, the one loss and its two halves, the cross-baseline synthesis, and
+section W's granularity result — stands unchanged.
+
 ## Notes on method
 
 - **Wall clock, not summed thread time.** An earlier harness accumulated each
@@ -1580,6 +1854,12 @@ both reproduce as *single samples* but not as medians:
   deviation at ~94% of the median; excluding it brings it to ~20%.
 - **Order alternated.** Whichever allocator always runs second inherits any drift
   over the life of the process.
+- **Record `MallocNanoZone` with every macOS measurement.** Set to `0` — which some
+  tooling environments do without saying so — it disables libmalloc's nano front-end
+  and makes the baseline 1.4–2.2x slower on small allocations. This is a fourth
+  silent platform failure alongside the three in sections Q, S and U, and the only
+  one that lives in the environment rather than in the code or the link line.
+  Section X.
 - `malloc`'s standard deviation stays high (often 30–50% of its median) even after
   these fixes. That is a statement about **whole-run totals**, not about
   individual calls — see section G, which measures per-call latency directly and
