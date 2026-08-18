@@ -5,3 +5,6 @@ cmake-build-*/
 .DS_Store
 *.o
 *.dSYM/
+
+# generated from README.zh.md
+README.zh.pdf
