@@ -13,6 +13,19 @@
 #include "ConcurrentAlloc.h"
 #include "AllocStats.h"
 
+// COMPARING AGAINST gperftools tcmalloc
+//
+// Link this binary with -ltcmalloc and the "malloc/free" column *becomes*
+// tcmalloc: on macOS gperftools takes over the default malloc zone, so plain
+// malloc routes to it. Verified -- allocating 80 MB through malloc grows
+// tcmalloc's own generic.current_allocated_bytes by 78 MB.
+//
+// So do not try to measure three allocators in one process. Build twice:
+//   plain           -> malloc column is macOS libmalloc
+//   with -ltcmalloc -> malloc column is gperftools tcmalloc
+// ConcurrentAlloc goes to mmap directly and is unaffected either way, so it is
+// the fixed point that makes the two runs comparable.
+
 #include <chrono>
 #include <cstring>
 #include <random>

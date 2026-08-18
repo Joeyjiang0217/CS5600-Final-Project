@@ -717,6 +717,93 @@ original code: under `-DNDEBUG` the assert is compiled out, so a future change t
 the flush amount would have silently corrupted `_size` in release builds while
 appearing fine in debug. The loop index was also `int` against a `size_t` count.
 
+## Q. Against real tcmalloc: the ramp weakness is architectural
+
+gperftools tcmalloc 2.18.1, the design this project is modelled on, and the one
+that has the two mechanisms sections N and O identified as missing: a **transfer
+cache** between thread caches and the central list, and **periodic scavenging**.
+
+### Method, and a trap worth recording
+
+Linking `-ltcmalloc` does not just add `tc_malloc`. On macOS gperftools takes over
+the **default malloc zone**, so plain `malloc` routes to tcmalloc as well.
+Verified directly: allocating 80 MB through `malloc` grew tcmalloc's own
+`generic.current_allocated_bytes` by 78 MB. A first attempt at a three-way
+comparison inside one process was therefore measuring tcmalloc twice and calling
+one of the columns libmalloc.
+
+The correct shape is two binaries:
+
+```bash
+c++ ... -o bench     main.cpp ...              # malloc column = macOS libmalloc
+c++ ... -ltcmalloc -o bench_tc main.cpp ...    # malloc column = gperftools tcmalloc
+```
+
+`ConcurrentAlloc` goes to `mmap` directly and is unaffected by which malloc is
+installed, so it is the fixed point that makes the two runs comparable — and it
+measures the same in both (4.33 / 4.20 ms, 1.96 / 1.90 ms, 4.55 / 4.51 ms).
+
+### Results — 4 threads, medians of five runs
+
+| workload | ours | libmalloc | real tcmalloc | ours vs libmalloc | ours vs tcmalloc |
+| --- | --- | --- | --- | --- | --- |
+| ramp/interleaved | 4.27 ms | **3.09 ms** | 3.60 ms | **0.71x** | 0.86x |
+| random/interleaved | 1.93 ms | 6.11 ms | 2.36 ms | 3.12x | 1.24x |
+| ramp/bulk | 4.53 ms | 19.21 ms | 13.21 ms | 4.22x | 2.93x |
+
+Peak RSS and page faults, one allocator per process:
+
+| workload | allocator | peak RSS | faults /1k |
+| --- | --- | --- | --- |
+| ramp/interleaved | ours | 125 MB | 3.1 |
+| | libmalloc | **8 MB** | 0.2 |
+| | real tcmalloc | **32 MB** | 0.6 |
+| ramp/bulk | ours | 212 MB | 1.4 |
+| | libmalloc | 134 MB | **40.4** |
+| | real tcmalloc | 154 MB | **1.3** |
+
+### Does real tcmalloc fix ramp/interleaved? No.
+
+**libmalloc 3.09 ms, real tcmalloc 3.60 ms, ours 4.27 ms.** Real tcmalloc — with
+the transfer cache and the scavenging — closes about 57% of our gap and **still
+loses to libmalloc by 17%**.
+
+So the weakness this project spent sections E through O characterising is **a
+property of the tcmalloc architecture on this workload, not a defect introduced by
+simplifying it**. Per-size-class thread caching has a shape of workload it handles
+worse than libmalloc's magazines, and adding the missing machinery narrows the gap
+without closing it.
+
+### What scavenging actually buys: 4x less memory
+
+On `ramp/interleaved` real tcmalloc holds **32 MB against our 125 MB** — 3.9x
+less — while being slightly *faster*. That is the concrete value of the mechanism
+section O showed we cannot omit: it converts our large memory problem into a small
+one at no speed cost. Section O's conclusion, that raising capacity without a way
+to lower it is strictly worse, is what this measurement looks like from the other
+side.
+
+### One result the page-fault story does not explain
+
+On `ramp/bulk` real tcmalloc takes **1.3 faults per thousand, essentially ours
+(1.4), not libmalloc's 40.4** — so it is not paying the re-fault cost that section I
+attributes libmalloc's slowness to. Yet it is still 2.9x slower than us. So there
+is a second reason tcmalloc-family allocators can be slow on a large cyclic live
+set, and page faults are not it. Not characterised here.
+
+### Limitations
+
+- **gperftools on Darwin goes through the malloc zone**, adding a dispatch layer
+  on every call that a Linux build would not have. Its absolute numbers are
+  penalised by that, so "2.9x faster than tcmalloc" should be read with caution.
+- **This is not modern google/tcmalloc.** That one needs Bazel and is officially
+  Linux-only; its per-CPU caches rely on restartable sequences, which do not exist
+  on Darwin, so even a successful build would fall back to per-thread mode and
+  would not test the mechanism this README keeps citing.
+- Our allocator still has the narrower contract (no `malloc(0)`, no alignment
+  guarantee, no `malloc_size`), so it is not a like-for-like replacement for either
+  opponent.
+
 ## Notes on method
 
 - **Wall clock, not summed thread time.** An earlier harness accumulated each
