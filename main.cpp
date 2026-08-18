@@ -72,6 +72,7 @@ struct Config {
     SizeMode sizeMode = SizeMode::Ramp;
     Pattern  pattern  = Pattern::BulkThenFree;
     unsigned seed     = 12345;
+    size_t   latStride = 64;    // mean gap between latency samples
 };
 
 // Returns the request size for iteration `i`.
@@ -98,6 +99,55 @@ struct Timing {
     size_t peakRssKiB = 0;
 };
 
+// ------------------------------------------------------------ latency sampling
+
+// Per-call latency, as opposed to the throughput numbers everywhere else.
+// Throughput answers "how long do 400 000 operations take"; a p99 answers "how
+// bad is the worst call in a hundred". A run-to-run standard deviation hints at
+// the second but cannot measure it -- 400 000 operations average the spikes away.
+struct LatencyData {
+    std::vector<uint32_t> allocNs;
+    std::vector<uint32_t> freeNs;
+};
+
+// Cost of reading the clock, measured rather than assumed. This decides whether
+// every call can be timed or whether sampling is required: the fast path is
+// around 2 ns, so a timer that costs more than that would be measuring itself.
+static double CalibrateTimerNs() {
+    const int N = 200000;
+    volatile long long sink = 0;
+    Clock::time_point t0 = Clock::now();
+    for (int i = 0; i < N; ++i) {
+        Clock::time_point t = Clock::now();
+        sink += t.time_since_epoch().count();
+    }
+    double total = std::chrono::duration<double, std::nano>(Clock::now() - t0).count();
+    (void)sink;
+    return total / N;
+}
+
+static double Percentile(const std::vector<uint32_t>& sorted, double q) {
+    if (sorted.empty()) return 0;
+    double idx = q * (sorted.size() - 1);
+    size_t lo = (size_t)idx;
+    size_t hi = lo + 1 < sorted.size() ? lo + 1 : lo;
+    double frac = idx - lo;
+    return sorted[lo] * (1.0 - frac) + sorted[hi] * frac;
+}
+
+static void ReportLatency(const char* tag, const char* op,
+                          std::vector<uint32_t> xs, double timerNs) {
+    if (xs.empty()) { printf("%-18s %-6s (no samples)\n", tag, op); return; }
+    std::sort(xs.begin(), xs.end());
+    // The clock read brackets the call, so each sample carries one timer cost.
+    auto adj = [&](double v) { double r = v - timerNs; return r > 0 ? r : 0.0; };
+    printf("%-18s %-6s %9zu %8.0f %8.0f %8.0f %8.0f %9.0f\n",
+           tag, op, xs.size(),
+           adj(Percentile(xs, 0.50)), adj(Percentile(xs, 0.90)),
+           adj(Percentile(xs, 0.99)), adj(Percentile(xs, 0.999)),
+           adj((double)xs.back()));
+}
+
 // A reusable sense-reversing barrier for `n` threads. Counting up to a
 // per-round target breaks as soon as threads drift between rounds, so track a
 // generation instead and let each thread wait for the generation to advance.
@@ -113,7 +163,8 @@ static void WaitAtBarrier(std::atomic<size_t>& state, size_t n) {
 
 // Alloc is the allocation function, Free the matching deallocation.
 template <class AllocFn, class FreeFn>
-static Timing RunOnce(const Config& cfg, AllocFn Alloc, FreeFn Free) {
+static Timing RunOnce(const Config& cfg, AllocFn Alloc, FreeFn Free,
+                      std::vector<LatencyData>* lat = nullptr) {
     std::vector<std::thread> threads(cfg.nworks);
     std::atomic<double> threadMsTotal{0.0};
 
@@ -132,15 +183,59 @@ static Timing RunOnce(const Config& cfg, AllocFn Alloc, FreeFn Free) {
             std::mt19937 rng(cfg.seed + (unsigned)k);
             std::vector<void*> local;
             local.reserve(cfg.ntimes);
+
+            // Latency sampling. The gap between samples is randomised around
+            // cfg.latStride rather than fixed: slow paths recur on a period
+            // (a refill every ~16 allocations, say), and a fixed stride can
+            // alias with that period and systematically over- or under-sample
+            // them.
+            LatencyData* L = lat ? &(*lat)[k] : nullptr;
+            std::mt19937 srng(cfg.seed * 7919 + (unsigned)k);
+            size_t nextA = L ? srng() % (2 * cfg.latStride) : (size_t)-1;
+            size_t nextF = L ? srng() % (2 * cfg.latStride) : (size_t)-1;
+            size_t ctrA = 0, ctrF = 0;
+            auto bump = [&](size_t& next, size_t& ctr) {
+                next = ctr + 1 + srng() % (2 * cfg.latStride);
+            };
+            // Time one call and record it; `ctr` counts calls of that kind.
+            auto TimedAlloc = [&](size_t sz) -> void* {
+                if (L && ctrA == nextA) {
+                    Clock::time_point a = Clock::now();
+                    void* p = Alloc(sz);
+                    Clock::time_point b = Clock::now();
+                    L->allocNs.push_back((uint32_t)std::chrono::duration_cast<
+                        std::chrono::nanoseconds>(b - a).count());
+                    bump(nextA, ctrA);
+                    ++ctrA;
+                    return p;
+                }
+                ++ctrA;
+                return Alloc(sz);
+            };
+            auto TimedFree = [&](void* p) {
+                if (L && ctrF == nextF) {
+                    Clock::time_point a = Clock::now();
+                    Free(p);
+                    Clock::time_point b = Clock::now();
+                    L->freeNs.push_back((uint32_t)std::chrono::duration_cast<
+                        std::chrono::nanoseconds>(b - a).count());
+                    bump(nextF, ctrF);
+                    ++ctrF;
+                    return;
+                }
+                ++ctrF;
+                Free(p);
+            };
+
             Clock::time_point t0 = Clock::now();
 
             for (size_t r = 0; r < cfg.rounds; ++r) {
                 switch (cfg.pattern) {
                     case Pattern::BulkThenFree: {
                         for (size_t i = 0; i < cfg.ntimes; ++i)
-                            local.push_back(Alloc(SizeFor(cfg.sizeMode, i, rng)));
+                            local.push_back(TimedAlloc(SizeFor(cfg.sizeMode, i, rng)));
                         for (size_t i = 0; i < cfg.ntimes; ++i)
-                            Free(local[i]);
+                            TimedFree(local[i]);
                         local.clear();
                         break;
                     }
@@ -154,12 +249,12 @@ static Timing RunOnce(const Config& cfg, AllocFn Alloc, FreeFn Free) {
                         std::vector<void*> ring(window, nullptr);
                         size_t pos = 0;
                         for (size_t i = 0; i < cfg.ntimes; ++i) {
-                            void* p = Alloc(SizeFor(cfg.sizeMode, i, rng));
-                            if (ring[pos]) Free(ring[pos]);
+                            void* p = TimedAlloc(SizeFor(cfg.sizeMode, i, rng));
+                            if (ring[pos]) TimedFree(ring[pos]);
                             ring[pos] = p;
                             pos = (pos + 1) % window;
                         }
-                        for (void* p : ring) if (p) Free(p);
+                        for (void* p : ring) if (p) TimedFree(p);
                         break;
                     }
                     case Pattern::CrossThread: {
@@ -247,6 +342,7 @@ int main(int argc, char** argv) {
     Config cfg;
     bool csv = false;
     bool runMine = true, runSys = true;
+    bool latency = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -272,6 +368,8 @@ int main(int argc, char** argv) {
             else if (v == "cross")       cfg.pattern = Pattern::CrossThread;
             else { fprintf(stderr, "unknown --pattern %s\n", v.c_str()); return 2; }
         }
+        else if (a == "--latency")    latency = true;
+        else if (a == "--lat-stride") cfg.latStride = std::stoul(next());
         else if (a == "--only") {
             std::string v = next();
             if      (v == "mine") { runMine = true;  runSys = false; }
@@ -288,6 +386,8 @@ int main(int argc, char** argv) {
                    "  --size MODE     fixed | ramp | random | large (default ramp)\n"
                    "  --pattern MODE  bulk | interleaved | cross (default bulk)\n"
                    "  --seed N        RNG seed (default 12345)\n"
+                   "  --latency       per-call latency percentiles instead of throughput\n"
+                   "  --lat-stride N  mean gap between latency samples (default 64)\n"
                    "  --csv           machine-readable output\n", argv[0]);
             return 0;
         }
@@ -298,6 +398,50 @@ int main(int argc, char** argv) {
     auto MineFree = [](void* p) { ConcurrentFree(p); };
     auto Sys = [](size_t n) { return malloc(n); };
     auto SysFree = [](void* p) { free(p); };
+
+    if (latency) {
+        if (cfg.pattern == Pattern::CrossThread) {
+            fprintf(stderr, "--latency does not support --pattern cross: the "
+                            "barrier wait would be counted inside a free.\n");
+            return 2;
+        }
+        double timerNs = CalibrateTimerNs();
+
+        // Warm up, then collect. Sampling perturbs throughput, so this mode
+        // deliberately reports no speedup -- the two are measured separately.
+        Config warm = cfg; warm.rounds = 1;
+        RunOnce(warm, Mine, MineFree);
+        RunOnce(warm, Sys, SysFree);
+
+        std::vector<LatencyData> lmine(cfg.nworks), lsys(cfg.nworks);
+        RunOnce(cfg, Mine, MineFree, &lmine);
+        RunOnce(cfg, Sys, SysFree, &lsys);
+
+        auto merge = [&](std::vector<LatencyData>& v, bool allocSide) {
+            std::vector<uint32_t> out;
+            for (auto& d : v) {
+                const std::vector<uint32_t>& s = allocSide ? d.allocNs : d.freeNs;
+                out.insert(out.end(), s.begin(), s.end());
+            }
+            return out;
+        };
+
+        printf("========================================================\n");
+        printf("PER-CALL LATENCY  size=%s pattern=%s threads=%zu\n",
+               SizeModeName(cfg.sizeMode), PatternName(cfg.pattern), cfg.nworks);
+        printf("sampled 1 call in ~%zu (randomised stride); "
+               "clock read costs %.1f ns, subtracted\n", cfg.latStride, timerNs);
+        printf("--------------------------------------------------------\n");
+        printf("%-18s %-6s %9s %8s %8s %8s %8s %9s\n",
+               "allocator", "op", "samples", "p50", "p90", "p99", "p99.9", "max");
+        ReportLatency("ConcurrentAlloc", "alloc", merge(lmine, true),  timerNs);
+        ReportLatency("ConcurrentAlloc", "free",  merge(lmine, false), timerNs);
+        ReportLatency("malloc/free",     "alloc", merge(lsys, true),   timerNs);
+        ReportLatency("malloc/free",     "free",  merge(lsys, false),  timerNs);
+        printf("========================================================\n");
+        printf("all figures in nanoseconds\n");
+        return 0;
+    }
 
     // One discarded warm-up pass each. The first pass pays for lazily created
     // ThreadCaches, page-map nodes, and first-touch page faults, none of which

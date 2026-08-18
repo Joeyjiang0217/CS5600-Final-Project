@@ -137,6 +137,84 @@ win/win/lose split by size distribution is solid even though the magnitudes are
 not stable to better than 20-30%. Any single figure in the tables above should be
 read as +/- 25%.
 
+## G. Per-call latency
+
+Everything above is throughput: how long 400 000 operations take. This measures
+the distribution of individual calls, which is a different question — a run-to-run
+standard deviation cannot answer it, because 400 000 operations average the
+spikes away.
+
+```bash
+./bench --latency --threads 4 --rounds 20 --ntimes 10000 --lat-stride 16 \
+        --size ramp --pattern interleaved
+```
+
+**Method and its limits.** `steady_clock::now()` costs **16–26 ns** on this
+machine, measured at startup — roughly 10x the ~2 ns fast path, so timing every
+call would mostly measure the clock. Instead one call in ~16 is timed, with the
+gap **randomised** so it cannot alias with periodic slow paths (a refill every
+~16 allocations would otherwise be systematically over- or under-sampled). One
+clock cost is subtracted from each sample and the result clamped at zero.
+
+Two consequences:
+
+- **p50 and p90 are not resolvable.** Both allocators sit at the measurement
+  floor. Where the table shows `0` for this allocator and ~20 ns for malloc, that
+  means malloc's median call is about one timer-tick slower — directionally
+  consistent with Finding 1, but at the edge of what this can see.
+- **`max` is a single sample** and mostly reflects OS noise (page faults,
+  preemption) that hits both allocators equally. Read p99 and p99.9; treat `max`
+  as an anecdote.
+
+All figures in nanoseconds, ~48 000 samples per cell, 4 threads.
+
+### Bounded live set (`--pattern interleaved`)
+
+| size | allocator | op | p99 | p99.9 | max |
+| --- | --- | --- | --- | --- | --- |
+| fixed 16 B | ours | alloc | 64 | 106 | 13 689 |
+| | malloc | alloc | 23 | 106 | 24 522 |
+| random | ours | alloc | **67** | 650 | 62 234 |
+| | malloc | alloc | **234** | 704 | 38 193 |
+| ramp | ours | alloc | **485** | **9 842** | 99 985 |
+| | malloc | alloc | **110** | **610** | 53 526 |
+
+### Bulk (`--pattern bulk`)
+
+| size | allocator | op | p90 | p99 | p99.9 | max |
+| --- | --- | --- | --- | --- | --- | --- |
+| ramp | ours | alloc | **24** | **649** | 6 933 | 65 316 |
+| | malloc | alloc | **482** | **1 483** | 9 532 | 100 607 |
+| ramp | ours | free | 24 | **315** | 2 891 | 67 399 |
+| | malloc | free | 316 | **1 441** | 16 308 | **592 274** |
+| fixed | ours | alloc | 19 | **19** | 8 319 | 50 852 |
+| | malloc | alloc | 19 | **311** | 1 002 | 48 185 |
+
+### What it says
+
+**Tail latency tracks throughput; it is not an independent advantage.** Where
+this allocator stays on the fast path it also has the better tail; where it falls
+into the locked cascade it has the worse one. Same mechanism as Finding 2, seen
+from a different angle:
+
+| workload | throughput | p99 |
+| --- | --- | --- |
+| random / interleaved | ours 3.8x | ours 3.5x better |
+| ramp / bulk | ours 4.4x | ours 2.3x better (p90 20x better) |
+| fixed / interleaved | ours 2.6x | roughly tied |
+| **ramp / interleaved** | **ours 0.8x** | **malloc 4.4x better** |
+
+The p99.9 in that last row is **9 842 ns against 610 ns — 16x worse**. Our slow
+path is a cascade (free list empty → CentralCache lock → PageCache lock → `mmap`
+syscall), and the ramp drives it constantly. libmalloc's refill is shallower and
+bounded.
+
+One number worth pulling out: libmalloc's worst `free` in `ramp/bulk` is
+**592 µs**. That is the cost of actually returning memory to the OS — which is
+the same behaviour that makes it use 11x less memory in section D. This allocator
+never returns memory below 1 MB, so it never pays that spike. **Memory footprint
+and tail latency are the same trade-off seen from two sides.**
+
 ## Notes on method
 
 - **Wall clock, not summed thread time.** An earlier harness accumulated each
@@ -150,5 +228,6 @@ read as +/- 25%.
 - **Order alternated.** Whichever allocator always runs second inherits any drift
   over the life of the process.
 - `malloc`'s standard deviation stays high (often 30–50% of its median) even after
-  these fixes. libmalloc is genuinely more variable than this allocator under
-  concurrent load, which is itself a result.
+  these fixes. That is a statement about **whole-run totals**, not about
+  individual calls — see section G, which measures per-call latency directly and
+  does not support reading a tail-latency claim into it.

@@ -284,7 +284,44 @@ One note of precision the original write-up got wrong: it called this ramp
 "random-sized allocations". A deterministic ascending sweep is not neutral for a
 size-class allocator — it is the one shape that defeats local recycling.
 
-### Finding 3 — the memory cost is much larger than "some overhead"
+### Finding 3 — tail latency follows the fast path, it is not a separate win
+
+Throughput answers "how long do 400 000 calls take". It says nothing about the
+worst call in a thousand, which is what a latency-sensitive service cares about.
+So: time one call in ~16, randomised so the sampling cannot alias with periodic
+slow paths, and take percentiles. (The clock itself costs 16–26 ns here, about
+10x the fast path, which is why sampling rather than full instrumentation — and
+why p50 is not resolvable for either allocator.)
+
+I expected this to be a clean win. This allocator's whole-run variance is lower
+than libmalloc's, and it seemed to follow that its calls would be steadier.
+
+They are not, and the split is the same one as Finding 2:
+
+| workload | throughput | p99 (alloc) |
+| --- | --- | --- |
+| random / interleaved | ours 3.8x | ours 67 ns vs 234 ns — **ours better** |
+| ramp / bulk | ours 4.4x | ours 649 ns vs 1 483 ns — **ours better** |
+| fixed / interleaved | ours 2.6x | 64 ns vs 23 ns — roughly tied |
+| **ramp / interleaved** | **ours 0.8x** | **485 ns vs 110 ns — malloc better** |
+
+At p99.9 on that last row it is **9 842 ns against 610 ns, 16x worse**. The slow
+path here is a cascade — free list empty, then the CentralCache lock, then the
+PageCache lock, then possibly an `mmap` syscall — and the ramp drives it
+constantly. libmalloc's refill is shallower and bounded.
+
+So there is no independent "more predictable" property to claim. **Tail latency
+is governed by the same thing as throughput: how often you fall off the fast
+path.** A whole-run standard deviation hints at that but cannot measure it, and
+on the one workload where it mattered, it pointed the wrong way.
+
+One number worth keeping: libmalloc's worst single `free` was **592 µs**. That is
+what returning memory to the OS costs — the same behaviour that makes it use 11x
+less memory in Finding 4. This allocator never returns anything under 1 MB, so it
+never pays that spike. Footprint and tail latency are one trade-off seen from two
+sides.
+
+### Finding 4 — the memory cost is much larger than "some overhead"
 
 Peak RSS, one allocator per process:
 
@@ -312,7 +349,7 @@ production tcmalloc adds, mapped onto the problems the measurements above found:
 
 | Mechanism | Problem it solves | Here |
 | --- | --- | --- |
-| **Per-CPU caches** (restartable sequences) | Cache count scales with cores, not threads — the main lever on Finding 3 | per-thread |
+| **Per-CPU caches** (restartable sequences) | Cache count scales with cores, not threads — the main lever on Finding 4 | per-thread |
 | **Returning memory to the OS** | Idle free lists and spans stop being resident | only spans >1 MB |
 | **Transfer cache** | Smooths cross-thread frees so neither side keeps hitting the central layer | absent (the 2.50x cross-thread case) |
 | **Adaptive cache sizing / periodic scavenging** | Free lists a workload has stopped using shrink back, instead of `MaxSize()` forcing a flush | `MaxSize()` only grows |
@@ -336,6 +373,7 @@ c++ -std=c++14 -O2 -DNDEBUG -pthread -o bench \
 ./bench --threads 4 --size ramp --pattern bulk --reps 15
 ./bench --threads 1 --size random --pattern interleaved   # the case it loses
 ./bench --size ramp --pattern interleaved --only mine     # peak RSS in isolation
+./bench --latency --lat-stride 16 --size ramp --pattern interleaved  # p99 / p99.9
 ```
 
 | Flag | Meaning |
@@ -346,6 +384,8 @@ c++ -std=c++14 -O2 -DNDEBUG -pthread -o bench \
 | `--size` | `fixed` \| `ramp` \| `random` \| `large` |
 | `--pattern` | `bulk` \| `interleaved` \| `cross` |
 | `--only` | `mine` \| `sys` \| `both` — one allocator per process, for RSS |
+| `--latency` | per-call latency percentiles instead of throughput |
+| `--lat-stride N` | mean gap between latency samples (default 64) |
 | `--csv` | machine-readable output |
 
 Worth building with sanitizers before trusting any timing — an allocator that is
@@ -369,7 +409,7 @@ Course project, not a drop-in allocator:
   `malloc_usable_size`.
 - **No alignment guarantees beyond 8 bytes.** No over-aligned type support.
 - **Memory is essentially never returned to the OS** — only spans of 128+ pages.
-  Finding 3 is the consequence.
+  Finding 4 is the consequence.
 - **Slower than the system allocator on one measured workload** — ascending
   sizes with a bounded live set, 0.65-0.82x. Finding 2 quantifies why. On a
   bounded live set with fixed or random sizes it is 2.1-3.9x faster.
@@ -382,6 +422,10 @@ Course project, not a drop-in allocator:
   macOS libmalloc. glibc's ptmalloc, jemalloc, mimalloc and real tcmalloc would
   all behave differently, and the honest comparison for a "tcmalloc-style"
   allocator is against tcmalloc itself — which I have not run.
+- **Run-to-run variance is not a tail-latency result.** `libmalloc`'s standard
+  deviation across whole runs is high, but that is a statement about 400 000
+  operations in aggregate. Measured per call (Finding 3), the tail goes the other
+  way on this allocator's worst workload.
 - **`libmalloc`'s run-to-run variance is high** (standard deviation often 30–50%
   of its median under load) even with warm-up and alternated ordering. Medians
   over 15 repetitions are reported for that reason; single runs are not
