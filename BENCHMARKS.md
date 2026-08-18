@@ -1823,7 +1823,30 @@ there is under 1 ns and this method cannot resolve it.
 libmalloc returns a valid 16-byte block for `malloc(0)`. This is the same shape as
 the `FetchFromCentralCache` bug in section P: undefined behaviour that assertions
 hide in debug builds and that exists only in the configuration you benchmark.
-Recorded, not yet fixed.
+
+**Fixed**, by mapping a zero-byte request to the smallest size class in both
+`RoundUp` and `Index`. `RoundUp(0)` previously returned 0, which would also have
+divided by zero in `NumMoveSize`. 1 000 successive `ConcurrentAlloc(0)` calls now
+return non-null, 8-byte-aligned, mutually distinct, freeable pointers under both an
+`-O2 -DNDEBUG` and an assert-enabled build, and `ramp/interleaved` and
+`fixed/interleaved` are unchanged at 3.54 and 0.88 ms against 3.53 and 0.89 ms
+before — the guard is a compare on a path that costs about 2 ns.
+
+**The gate that missed it has been extended.** `verify.cpp` gained a size-boundary
+pass that walks both sides of every size-class transition — 0, then each of
+1, 8, 128, 1 KB, 8 KB, 64 KB, `MAX_BYTES` and their neighbours, then `2 x MAX_BYTES`
+— holding every block live simultaneously so an overlap shows as a corrupted stamp.
+The workload loops sweep sizes but never reach the ends of the range, which is why
+none of the 12 existing combinations could have caught this.
+
+Extending the negative control was the harder half. `BrokenAlloc` handed out
+64-byte-strided pointers from a 64 KB slab, so the boundary pass's 512 KB request
+wrote past the end and aborted the process before it reported anything. Enlarging
+the slab fixed the crash and **silently weakened the control**: the wrap distance
+grew with it, small allocations stopped colliding, and `fixed/bulk` began passing
+under `--alloc broken`. Wrap and slab size have to be set independently — the wrap
+small enough to collide, the slab larger than the wrap plus the biggest request.
+All 13 rows now fail under the negative control and pass under `--alloc sys`.
 
 ### What this section supersedes
 

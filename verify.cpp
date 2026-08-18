@@ -36,6 +36,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <set>
 #include <string>
 #include <vector>
 #include <thread>
@@ -68,11 +69,24 @@ struct VConfig {
 // detect. If `--alloc broken` reports PASS, the checks above are not actually
 // checking anything and nothing else in this file should be trusted.
 static void* BrokenAlloc(size_t n) {
-    static const size_t kSlab = 64 * 1024;
+    // The slab has to be large enough that even the boundary check's biggest
+    // request (2 x MAX_BYTES) stays inside it. A negative control must be
+    // detectably wrong without being memory-unsafe for the harness itself --
+    // a 64 KB slab let the boundary check write past the end and abort before
+    // reporting anything, which made the control useless rather than failing.
+    // The wrap has to stay small so that live blocks start overlapping almost
+    // immediately; the slab has to be larger than the wrap plus the biggest
+    // request the checks make, so nothing writes past the end. Sizing the slab
+    // alone is not enough -- widening the wrap along with it silently stopped
+    // small allocations from colliding, and fixed/bulk started passing under
+    // the negative control, which is exactly the failure mode this control
+    // exists to rule out.
+    static const size_t kWrap = 32 * 1024;
+    static const size_t kSlab = kWrap + 2 * MAX_BYTES;
     static unsigned char slab[kSlab];
     static std::atomic<size_t> cursor{0};
-    // Wraps deliberately, so live blocks start overlapping almost immediately.
-    size_t off = cursor.fetch_add(64) % (kSlab / 2);
+    // The 64-byte stride means any request above 64 bytes already overlaps.
+    size_t off = cursor.fetch_add(64) % kWrap;
     (void)n;
     return slab + off;
 }
@@ -309,6 +323,70 @@ static void RunCheck(const VConfig& cfg, AllocFn Alloc, FreeFn Free,
 
 // ------------------------------------------------------------------- driver
 
+// Size-boundary contract check.
+//
+// The workload loops above sweep sizes but never touch the ends of the range,
+// so they cannot see an off-by-one in the size-class table. That is how
+// ConcurrentAlloc(0) survived: Index(0) underflowed to SIZE_MAX and indexed
+// past _freeList[], caught by an assert in debug builds and by nothing at all
+// under -DNDEBUG. This walks both sides of every size-class transition, holds
+// every block live at once so an overlap shows up as a corrupted stamp, and
+// treats a null or misaligned return as a failure.
+template <class AllocFn, class FreeFn>
+static void RunBoundaryCheck(AllocFn Alloc, FreeFn Free, Failures& f) {
+    std::vector<size_t> sizes;
+    sizes.push_back(0);
+    // both sides of every alignment-group transition, plus the ends
+    const size_t edges[] = { 1, 8, 128, 1024, 8 * 1024, 64 * 1024, MAX_BYTES };
+    for (size_t i = 0; i < sizeof(edges) / sizeof(edges[0]); ++i) {
+        if (edges[i] > 1) sizes.push_back(edges[i] - 1);
+        sizes.push_back(edges[i]);
+        sizes.push_back(edges[i] + 1);
+    }
+    // above MAX_BYTES the request bypasses ThreadCache entirely
+    sizes.push_back(MAX_BYTES * 2);
+
+    std::vector<Block> live;
+    std::set<void*> seen;
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        const size_t n = sizes[i];
+        void* p = Alloc(n);
+        uint64_t tag = Mix(0xB0D1CE5EEDull + (uint64_t)(i + 1));
+        if (p == nullptr) {
+            f.nullPtr.fetch_add(1);
+            f.Note("null return for size " + std::to_string(n));
+            continue;
+        }
+        if (reinterpret_cast<uintptr_t>(p) % sizeof(void*) != 0) {
+            f.misaligned.fetch_add(1);
+            char buf[128];
+            snprintf(buf, sizeof(buf), "misaligned %p for size %zu", p, n);
+            f.Note(buf);
+        }
+        if (!seen.insert(p).second) {
+            f.duplicate.fetch_add(1);
+            char buf[128];
+            snprintf(buf, sizeof(buf), "duplicate live pointer %p (size %zu)", p, n);
+            f.Note(buf);
+        }
+        FillBlock(p, n, tag);
+        live.push_back(Block{ p, n, tag });
+    }
+    // every block is live simultaneously, so any overlap is visible now
+    for (size_t i = 0; i < live.size(); ++i) {
+        size_t badOff = 0;
+        if (!CheckBlock(live[i].p, live[i].n, live[i].tag, &badOff)) {
+            f.corrupted.fetch_add(1);
+            char buf[160];
+            snprintf(buf, sizeof(buf),
+                     "stamp corrupted at %p size %zu byte %zu (overlapping or short block)",
+                     live[i].p, live[i].n, badOff);
+            f.Note(buf);
+        }
+    }
+    for (size_t i = 0; i < live.size(); ++i) Free(live[i].p);
+}
+
 static const char* SizeName(VSizeMode m) {
     switch (m) {
         case VSizeMode::Fixed16:   return "fixed";
@@ -454,6 +532,30 @@ int main(int argc, char** argv) {
                 allMessages.push_back(std::string(SizeName(c.sizeMode)) + "/" +
                                       PatternName(c.pattern) + ": " + f.messages[m]);
         }
+    }
+
+    // The boundary check is not a size x pattern combination; it exercises the
+    // API contract at the ends of the range instead of in the middle.
+    {
+        Failures f;
+        if (cfg.mode == AllocMode::Sys) {
+            RunBoundaryCheck([](size_t n) { return malloc(n); },
+                             [](void* p) { free(p); }, f);
+        } else if (cfg.mode == AllocMode::Broken) {
+            RunBoundaryCheck(BrokenAlloc, BrokenFree, f);
+        } else {
+            RunBoundaryCheck([](size_t n) { return ConcurrentAlloc(n); },
+                             [](void* p) { ConcurrentFree(p); }, f);
+        }
+        size_t total = f.Total();
+        grandTotal += total;
+        printf("%-11s %-12s %10zu %10zu %10zu %10zu   %s\n",
+               "boundary", "size 0..512K",
+               f.nullPtr.load(), f.misaligned.load(),
+               f.corrupted.load(), f.duplicate.load(),
+               total == 0 ? "PASS" : "*** FAIL ***");
+        for (size_t m = 0; m < f.messages.size(); ++m)
+            allMessages.push_back("boundary: " + f.messages[m]);
     }
 
     if (!allMessages.empty()) {

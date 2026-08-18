@@ -182,13 +182,22 @@ suspect. The gate here is `verify.cpp`: it stamps every block with a verifiable
 pattern and counts four classes of failure — null returns, misalignment, corrupted
 stamps (a block handed out twice or short), and double frees.
 
+It runs the 12 size-by-pattern combinations plus a **size-boundary pass** that walks
+both sides of every size-class transition, from a zero-byte request up past the
+256 KB threshold where allocations bypass the thread cache. The workload loops sweep
+sizes but never reach the ends of the range, so they cannot see an off-by-one in the
+size-class table — which is how a `ConcurrentAlloc(0)` crash survived until the
+boundary pass was added.
+
 **AddressSanitizer is nearly useless for this.** A custom allocator's free lists are
 opaque to it — there is not one `ASAN_POISON` annotation in the project — so it
 cannot see inside them. Measured: on a deliberately broken allocator, **ASan
 reports 0 errors and `verify.cpp` catches 12**.
 
-The gate itself needs verifying: `--alloc broken` must FAIL, or the gate proves
-nothing.
+The gate itself needs verifying: `--alloc broken` must FAIL on **every** row, and
+`--alloc sys` must pass on every row. Both are checked; getting the negative control
+wrong is easy — widening its slab to fit the boundary pass silently stopped small
+allocations from colliding, and one row started passing when it should not.
 
 ### Three methodological rules
 
@@ -474,9 +483,6 @@ A course project, not a usable allocator:
 - **Not a `malloc` replacement.** Called explicitly as
   `ConcurrentAlloc`/`ConcurrentFree`; no `operator new` override, no `LD_PRELOAD`
   shim, and no `realloc`, `calloc`, `posix_memalign` or `malloc_usable_size`.
-- **`ConcurrentAlloc(0)` crashes.** `Index(0)` underflows to `SIZE_MAX` and indexes
-  past the free-list array. An assert-enabled build catches it; the `-DNDEBUG` build
-  crashes. **Known defect, unfixed.**
 - **No alignment guarantee beyond 8 bytes.** No over-aligned type support.
 - **Memory is essentially never returned to the OS** — only spans of 128+ pages.
   Section 5.4 is the consequence.

@@ -190,8 +190,19 @@ public:
         return (bytes + alignNum - 1) & ~(alignNum - 1);
     }
 
+    // A zero-byte request has to land in the smallest size class. `malloc(0)`
+    // must return a unique, freeable pointer, and more urgently _Index(0, 3)
+    // computes ((0 + 7) >> 3) - 1, which underflows to SIZE_MAX and indexes
+    // past _freeList[]. The assert in FetchFromCentralCache caught that in
+    // debug builds and vanished under -DNDEBUG -- the same shape of bug as the
+    // non-void fall-through in the 64-bit port. RoundUp(0) also used to return
+    // 0, which would divide by zero in NumMoveSize.
     static inline size_t RoundUp(size_t size)
     {
+        if (size == 0)
+        {
+            return 8;
+        }
         if (size <= 128)
         {
             return _RoundUp(size, 8);
@@ -223,9 +234,15 @@ public:
         return ((bytes + (1 << align_shift) - 1) >> align_shift) - 1;
     }
 
+    // Zero maps to the smallest class, for the reason given above RoundUp.
     static inline size_t Index(size_t bytes)
     {
         assert(bytes <= MAX_BYTES);
+
+        if (bytes == 0)
+        {
+            return 0;
+        }
 
         static const size_t group_array[4] = { 16, 56, NCLASS_MID, 56 };
         if (bytes <= 128){
